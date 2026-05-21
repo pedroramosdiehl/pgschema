@@ -38,6 +38,12 @@ type TomlConfig struct {
 	DefaultPrivileges DefaultPrivilegeIgnoreConfig `toml:"default_privileges,omitempty"`
 	Constraints       ConstraintIgnoreConfig       `toml:"constraints,omitempty"`
 	ConstraintsFK     ConstraintFKIgnoreConfig     `toml:"constraints_fk,omitempty"`
+	DMLTables         DMLTableIgnoreConfig         `toml:"dml_tables,omitempty"`
+}
+
+// TableIgnoreConfig represents table-specific ignore configuration
+type DMLTableIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
 }
 
 // TableIgnoreConfig represents table-specific ignore configuration
@@ -129,6 +135,7 @@ func LoadIgnoreFileWithStructureFromPath(filePath string) (*ir.IgnoreConfig, err
 		DefaultPrivileges: tomlConfig.DefaultPrivileges.Patterns,
 		Constraints:       tomlConfig.Constraints.Patterns,
 		ConstraintsFK:     tomlConfig.ConstraintsFK.Patterns,
+		DMLTables:         tomlConfig.DMLTables.Patterns,
 	}
 
 	return config, nil
