@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$SCRIPT_DIR"
+PROPERTIES_FILE="$REPO_ROOT/.pgschema-wrapper.properties"
+
+if [[ ! -f "$PROPERTIES_FILE" ]]; then
+  echo "pgschema wrapper config not found: $PROPERTIES_FILE" >&2
+  echo "Run ./scripts/wrapper/generate.sh --version <x.y.z> first." >&2
+  exit 1
+fi
+
+read_property() {
+  local key="$1"
+  awk -F'=' -v wanted="$key" '
+    $0 ~ /^[[:space:]]*#/ { next }
+    NF >= 2 {
+      k=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == wanted) {
+        v=substr($0, index($0, "=")+1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+  ' "$PROPERTIES_FILE"
+}
+
+VERSION="${PGSCHEMAW_VERSION:-$(read_property "pgschema.version")}"
+BASE_URL="${PGSCHEMAW_BASE_URL:-$(read_property "pgschema.baseUrl")}"
+CACHE_DIR="${PGSCHEMAW_CACHE_DIR:-$(read_property "pgschema.cacheDir")}"
+SOURCE="${PGSCHEMAW_SOURCE:-$(read_property "pgschema.source")}"
+LOCAL_REBUILD="${PGSCHEMAW_LOCAL_REBUILD:-false}"
+
+if [[ -z "$VERSION" ]]; then
+  echo "Missing pgschema.version in $PROPERTIES_FILE" >&2
+  exit 1
+fi
+if [[ -z "$BASE_URL" ]]; then
+  BASE_URL="https://github.com/pgplex/pgschema/releases/download"
+fi
+if [[ -z "$CACHE_DIR" ]]; then
+  CACHE_DIR="$REPO_ROOT/.pgschema/wrapper/bin"
+fi
+if [[ -z "$SOURCE" ]]; then
+  SOURCE="remote"
+fi
+if [[ "$SOURCE" != "remote" && "$SOURCE" != "local" ]]; then
+  echo "Invalid pgschema.source: $SOURCE (expected: remote|local)" >&2
+  exit 1
+fi
+
+VERSION="${VERSION#v}"
+
+detect_os() {
+  case "$(uname -s)" in
+    Linux) echo "linux" ;;
+    Darwin) echo "darwin" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      echo "Windows native shell is not supported. Use WSL or PowerShell wrapper." >&2
+      exit 1
+      ;;
+    *)
+      echo "Unsupported OS: $(uname -s)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    arm64|aarch64) echo "arm64" ;;
+    *)
+      echo "Unsupported architecture: $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+verify_sha256_if_present() {
+  local binary_path="$1"
+  local key="pgschema.sha256.${OS}-${ARCH}"
+  local expected
+  expected="$(read_property "$key")"
+  if [[ -z "$expected" ]]; then
+    return 0
+  fi
+
+  local actual=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$binary_path" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$binary_path" | awk '{print $1}')"
+  else
+    echo "Checksum configured ($key) but no sha256 tool found (sha256sum/shasum)." >&2
+    exit 1
+  fi
+
+  if [[ "$actual" != "$expected" ]]; then
+    echo "Checksum mismatch for $binary_path" >&2
+    echo "Expected: $expected" >&2
+    echo "Actual:   $actual" >&2
+    exit 1
+  fi
+}
+
+download_file() {
+  local url="$1"
+  local output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --retry 3 --retry-delay 1 "$url" -o "$output"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$output" "$url"
+  else
+    echo "Neither curl nor wget is available to download pgschema." >&2
+    exit 1
+  fi
+}
+
+build_local_binary() {
+  local output="$1"
+  if ! command -v go >/dev/null 2>&1; then
+    echo "Go is required for local wrapper source mode." >&2
+    exit 1
+  fi
+  local tmp_file="${output}.tmp"
+  echo "Building pgschema locally for ${OS}/${ARCH}" >&2
+  (
+    cd "$REPO_ROOT"
+    CGO_ENABLED=0 GOOS="$OS" GOARCH="$ARCH" go build -o "$tmp_file" .
+  )
+  chmod +x "$tmp_file"
+  mv "$tmp_file" "$output"
+}
+
+OS="$(detect_os)"
+ARCH="$(detect_arch)"
+ASSET_NAME="pgschema-${VERSION}-${OS}-${ARCH}"
+TARGET_DIR="${CACHE_DIR}/${VERSION}/${OS}-${ARCH}"
+TARGET_BIN="${TARGET_DIR}/pgschema"
+DOWNLOAD_URL="${BASE_URL}/v${VERSION}/${ASSET_NAME}"
+
+mkdir -p "$TARGET_DIR"
+
+if [[ "$SOURCE" == "local" ]]; then
+  if [[ ! -x "$TARGET_BIN" || "$LOCAL_REBUILD" == "true" ]]; then
+    build_local_binary "$TARGET_BIN"
+  fi
+else
+  if [[ ! -x "$TARGET_BIN" ]]; then
+    TMP_FILE="${TARGET_BIN}.tmp"
+    echo "Downloading ${DOWNLOAD_URL}" >&2
+    download_file "$DOWNLOAD_URL" "$TMP_FILE"
+    chmod +x "$TMP_FILE"
+    mv "$TMP_FILE" "$TARGET_BIN"
+  fi
+fi
+
+if [[ "$SOURCE" == "remote" ]]; then
+  verify_sha256_if_present "$TARGET_BIN"
+fi
+exec "$TARGET_BIN" "$@"
