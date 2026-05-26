@@ -226,15 +226,20 @@ func ApplyMigration(config *ApplyConfig, provider postgres.DesiredStateProvider)
 		}
 	}
 
-	// Set search_path to target schema for unqualified table references
-	if config.Schema != "" && config.Schema != "public" {
-		quotedSchema := ir.QuoteIdentifier(config.Schema)
+	// Set search_path to primary schema for unqualified table references.
+	// For multi-schema input (e.g. "integracao,comum"), only the first schema
+	// is the default namespace for unqualified DDL emitted by plan.
+	primarySchema := resolvePrimarySchema(config.Schema)
+	if primarySchema != "" && primarySchema != "public" {
+		quotedSchema := ir.QuoteIdentifier(primarySchema)
 		searchPathSQL := fmt.Sprintf("SET search_path TO %s, public", quotedSchema)
 		_, err = util.ExecContextWithLogging(ctx, conn, searchPathSQL, "set search_path to target schema")
 		if err != nil {
-			return fmt.Errorf("failed to set search_path to target schema '%s': %w", config.Schema, err)
+			return fmt.Errorf("failed to set search_path to target schema '%s': %w", primarySchema, err)
 		}
-		fmt.Printf("Set search_path to: %s, public\n", quotedSchema)
+		if !config.Quiet {
+			fmt.Printf("Set search_path to: %s, public\n", quotedSchema)
+		}
 	}
 
 	// Generate SQL statements from the plan
@@ -405,8 +410,9 @@ func validateSchemaFingerprint(migrationPlan *plan.Plan, host string, port int, 
 		return fmt.Errorf("failed to get current database state for fingerprint validation: %w", err)
 	}
 
-	// Compute current fingerprint
-	currentFingerprint, err := fingerprint.ComputeFingerprint(currentStateIR, schema)
+	// Compute current fingerprint using the same multi-schema scope used by plan.
+	schemas := util.ParseSchemaList(schema)
+	currentFingerprint, err := fingerprint.ComputeFingerprintForSchemas(currentStateIR, schemas)
 	if err != nil {
 		return fmt.Errorf("failed to compute current fingerprint: %w", err)
 	}
@@ -417,6 +423,14 @@ func validateSchemaFingerprint(migrationPlan *plan.Plan, host string, port int, 
 	}
 
 	return nil
+}
+
+func resolvePrimarySchema(schemaSpec string) string {
+	schemas := util.ParseSchemaList(schemaSpec)
+	if len(schemas) == 0 {
+		return "public"
+	}
+	return schemas[0]
 }
 
 // executeGroup executes all steps in a group, handling directives separately from SQL statements

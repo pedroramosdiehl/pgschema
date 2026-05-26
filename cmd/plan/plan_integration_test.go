@@ -352,6 +352,185 @@ func TestPlanCommand_SchemaFiltering(t *testing.T) {
 	t.Log("Plan command executed successfully with schema filtering")
 }
 
+func TestPlanCommand_MultiSchemaHomonymousTables(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	embeddedPG := testutil.SetupPostgres(t)
+	defer embeddedPG.Stop()
+	conn, host, port, dbname, user, password := testutil.ConnectToPostgres(t, embeddedPG)
+	defer conn.Close()
+
+	container := &struct {
+		Conn     *sql.DB
+		Host     string
+		Port     int
+		DBName   string
+		User     string
+		Password string
+	}{
+		Conn:     conn,
+		Host:     host,
+		Port:     port,
+		DBName:   dbname,
+		User:     user,
+		Password: password,
+	}
+
+	setupSQL := `
+		CREATE SCHEMA integracao;
+		CREATE SCHEMA comum;
+	`
+	if _, err := conn.ExecContext(ctx, setupSQL); err != nil {
+		t.Fatalf("failed to setup schemas: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	integracaoDir := filepath.Join(tmpDir, "integracao")
+	comumDir := filepath.Join(tmpDir, "comum")
+	if err := os.MkdirAll(integracaoDir, 0755); err != nil {
+		t.Fatalf("failed to create integracao dir: %v", err)
+	}
+	if err := os.MkdirAll(comumDir, 0755); err != nil {
+		t.Fatalf("failed to create comum dir: %v", err)
+	}
+
+	integracaoSQL := `CREATE TABLE objetivo_desenvolvimento_sustentavel (
+  id bigint PRIMARY KEY
+);`
+	comumSQL := `CREATE TABLE objetivo_desenvolvimento_sustentavel (
+  id bigint PRIMARY KEY,
+  id_objetivo_desenvolvimento_sustentavel bigint
+);
+ALTER TABLE objetivo_desenvolvimento_sustentavel
+ADD CONSTRAINT objetivo_desenvolvimento_sust_fk
+FOREIGN KEY (id_objetivo_desenvolvimento_sustentavel)
+REFERENCES integracao.objetivo_desenvolvimento_sustentavel(id);`
+
+	if err := os.WriteFile(filepath.Join(integracaoDir, "schema.sql"), []byte(integracaoSQL), 0644); err != nil {
+		t.Fatalf("failed to write integracao schema file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(comumDir, "schema.sql"), []byte(comumSQL), 0644); err != nil {
+		t.Fatalf("failed to write comum schema file: %v", err)
+	}
+
+	bundlePath := filepath.Join(tmpDir, "schema.bundle.sql")
+	bundleSQL := "\\i integracao/schema.sql\n\\i comum/schema.sql\n"
+	if err := os.WriteFile(bundlePath, []byte(bundleSQL), 0644); err != nil {
+		t.Fatalf("failed to write bundle file: %v", err)
+	}
+
+	outputHuman = ""
+	outputJSON = ""
+	outputSQL = ""
+
+	cmd := &cobra.Command{}
+	*cmd = *PlanCmd
+	cmd.SetArgs([]string{
+		"--host", container.Host,
+		"--port", fmt.Sprintf("%d", container.Port),
+		"--db", container.DBName,
+		"--user", container.User,
+		"--password", container.Password,
+		"--schema", "integracao,comum",
+		"--file", bundlePath,
+		"--output-human", "stdout",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("plan command failed for homonymous multi-schema bundle: %v", err)
+	}
+}
+
+func TestPlanCommand_MultiSchemaGreenfieldCrossSchemaReferences(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	embeddedPG := testutil.SetupPostgres(t)
+	defer embeddedPG.Stop()
+	conn, host, port, dbname, user, password := testutil.ConnectToPostgres(t, embeddedPG)
+	defer conn.Close()
+
+	container := &struct {
+		Conn     *sql.DB
+		Host     string
+		Port     int
+		DBName   string
+		User     string
+		Password string
+	}{
+		Conn:     conn,
+		Host:     host,
+		Port:     port,
+		DBName:   dbname,
+		User:     user,
+		Password: password,
+	}
+
+	if _, err := conn.ExecContext(ctx, `CREATE SCHEMA integracao; CREATE SCHEMA comum;`); err != nil {
+		t.Fatalf("failed to setup schemas: %v", err)
+	}
+
+	tmpDir := t.TempDir()
+	integracaoDir := filepath.Join(tmpDir, "integracao")
+	comumDir := filepath.Join(tmpDir, "comum")
+	if err := os.MkdirAll(integracaoDir, 0755); err != nil {
+		t.Fatalf("failed to create integracao dir: %v", err)
+	}
+	if err := os.MkdirAll(comumDir, 0755); err != nil {
+		t.Fatalf("failed to create comum dir: %v", err)
+	}
+
+	// integracao references comum before comum chunk is materialized.
+	// This reproduces the greenfield failure mode from real-world bundles.
+	integracaoSQL := `CREATE VIEW vw_categoria AS
+SELECT c.id
+FROM comum.categoria_plano_trabalho c;`
+	comumSQL := `CREATE TABLE categoria_plano_trabalho (
+	id bigint PRIMARY KEY
+);`
+
+	if err := os.WriteFile(filepath.Join(integracaoDir, "schema.sql"), []byte(integracaoSQL), 0644); err != nil {
+		t.Fatalf("failed to write integracao schema file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(comumDir, "schema.sql"), []byte(comumSQL), 0644); err != nil {
+		t.Fatalf("failed to write comum schema file: %v", err)
+	}
+
+	bundlePath := filepath.Join(tmpDir, "schema.bundle.sql")
+	bundleSQL := "\\i integracao/schema.sql\n\\i comum/schema.sql\n"
+	if err := os.WriteFile(bundlePath, []byte(bundleSQL), 0644); err != nil {
+		t.Fatalf("failed to write bundle file: %v", err)
+	}
+
+	outputHuman = ""
+	outputJSON = ""
+	outputSQL = ""
+
+	cmd := &cobra.Command{}
+	*cmd = *PlanCmd
+	cmd.SetArgs([]string{
+		"--host", container.Host,
+		"--port", fmt.Sprintf("%d", container.Port),
+		"--db", container.DBName,
+		"--user", container.User,
+		"--password", container.Password,
+		"--schema", "integracao,comum",
+		"--file", bundlePath,
+		"--output-human", "stdout",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("plan command failed for greenfield cross-schema materialization: %v", err)
+	}
+}
+
 func TestPlanCommand_EmptyDatabase(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")

@@ -189,6 +189,17 @@ pgschema plan --schema public,app --file schema.sql ...
 
 See [cmd/plan/README.md](cmd/plan/README.md) for full behaviour and caveats (including how this relates to `dump` / `apply`).
 
+#### Plan execution model (dependency ordering)
+
+Generated migrations are ordered in phases to keep dependency handling deterministic:
+
+1. `DROP`
+2. `CREATE`
+3. `MODIFY`
+4. deferred foreign-key flush
+
+Foreign keys are deferred when the referenced dependency is not yet satisfiable at create time (including when a referenced PK/UNIQUE is added later in the same migration). This improves cyclic and cross-schema FK scenarios without forcing all FKs to be deferred.
+
 ### Step 4: Apply plan with confirmation
 
 ```bash
@@ -221,6 +232,15 @@ Do you want to apply these changes? (yes/no): yes
 Applying changes...
 Changes applied successfully!
 ```
+
+`apply` executes grouped plan steps with transaction-aware behavior:
+
+- groups without directives run as one implicit transaction
+- groups with directives run statement-by-statement
+- fingerprint validation prevents applying stale plans to drifted databases (including comma-separated multi-schema scopes)
+- generated plan/apply SQL should not include temporary plan schemas (`pgschema_tmp_*`)
+
+See [cmd/apply/README.md](cmd/apply/README.md) for full execution behavior.
 
 ## LLM / AI Integration
 

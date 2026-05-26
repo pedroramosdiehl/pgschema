@@ -6,9 +6,23 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/pgplex/pgschema/ir"
 )
+
+type GenerateOptions struct {
+	ForceQualifiedNames bool
+}
+
+var (
+	renderOptionsMu sync.Mutex
+	renderOptions   GenerateOptions
+)
+
+func forceQualifiedNamesEnabled() bool {
+	return renderOptions.ForceQualifiedNames
+}
 
 // DiffType represents the type of database object being changed
 type DiffType int
@@ -364,7 +378,7 @@ type viewDiff struct {
 	CommentChanged   bool
 	OldComment       string
 	NewComment       string
-	OptionsChanged   bool // View options (reloptions) changed
+	OptionsChanged   bool           // View options (reloptions) changed
 	AddedIndexes     []*ir.Index    // For materialized views
 	DroppedIndexes   []*ir.Index    // For materialized views
 	ModifiedIndexes  []*IndexDiff   // For materialized views
@@ -432,6 +446,19 @@ type rlsChange struct {
 
 // GenerateMigration compares two IR schemas and returns the SQL differences
 func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
+	return GenerateMigrationWithOptions(oldIR, newIR, targetSchema, GenerateOptions{})
+}
+
+// GenerateMigrationWithOptions compares two IR schemas and returns the SQL differences
+// with configurable SQL rendering behavior.
+func GenerateMigrationWithOptions(oldIR, newIR *ir.IR, targetSchema string, options GenerateOptions) []Diff {
+	renderOptionsMu.Lock()
+	renderOptions = options
+	defer func() {
+		renderOptions = GenerateOptions{}
+		renderOptionsMu.Unlock()
+	}()
+
 	diff := &ddlDiff{
 		addedSchemas:               []*ir.Schema{},
 		droppedSchemas:             []*ir.Schema{},
@@ -1542,6 +1569,7 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 		key := fmt.Sprintf("%s.%s", tableDiff.Table.Schema, tableDiff.Table.Name)
 		existingTables[key] = true
 	}
+	referencedConstraintsAddedInModify := buildReferencedConstraintsAddedInModifyLookup(d.modifiedTables)
 	// Build lookup of all new table names (qualified) for policy deferral (#373).
 	// Policies that reference other new tables must be deferred until all tables exist.
 	newTableLookup := make(map[string]struct{}, len(d.addedTables))
@@ -1575,7 +1603,14 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	}
 
 	// Create tables WITHOUT function/domain dependencies first (functions may reference these)
-	deferredPolicies1, deferredConstraints1 := generateCreateTablesSQL(tablesWithoutDeps, targetSchema, collector, existingTables, shouldDeferPolicy)
+	deferredPolicies1, deferredConstraints1 := generateCreateTablesSQL(
+		tablesWithoutDeps,
+		targetSchema,
+		collector,
+		existingTables,
+		referencedConstraintsAddedInModify,
+		shouldDeferPolicy,
+	)
 
 	// Build view lookup - needed for detecting functions that depend on views
 	newViewLookup := buildViewLookup(d.addedViews)
@@ -1606,7 +1641,14 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	generateCreateProceduresSQL(d.addedProcedures, targetSchema, collector)
 
 	// Create tables WITH function/domain dependencies (now that functions and deferred domains exist)
-	deferredPolicies2, deferredConstraints2 := generateCreateTablesSQL(tablesWithDeps, targetSchema, collector, existingTables, shouldDeferPolicy)
+	deferredPolicies2, deferredConstraints2 := generateCreateTablesSQL(
+		tablesWithDeps,
+		targetSchema,
+		collector,
+		existingTables,
+		referencedConstraintsAddedInModify,
+		shouldDeferPolicy,
+	)
 
 	// Queue foreign key constraints from BOTH batches for a flush after MODIFY so referenced
 	// tables and new PK/UNIQUE constraints from ALTER TABLE exist before ADD FOREIGN KEY.
@@ -1645,6 +1687,32 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	// 1. DROP+CREATE'd objects (e.g., materialized views) don't wipe out privilege changes
 	// 2. REVOKEs from modifications execute before new GRANTs
 	// See https://github.com/pgplex/pgschema/issues/324
+}
+
+func buildReferencedConstraintsAddedInModifyLookup(modifiedTables []*tableDiff) map[string][]*ir.Constraint {
+	if len(modifiedTables) == 0 {
+		return nil
+	}
+
+	lookup := make(map[string][]*ir.Constraint, len(modifiedTables))
+	for _, modified := range modifiedTables {
+		if modified == nil || modified.Table == nil || len(modified.AddedConstraints) == 0 {
+			continue
+		}
+
+		key := fmt.Sprintf("%s.%s", modified.Table.Schema, modified.Table.Name)
+		for _, candidate := range modified.AddedConstraints {
+			if candidate == nil {
+				continue
+			}
+			if candidate.Type != ir.ConstraintTypePrimaryKey && candidate.Type != ir.ConstraintTypeUnique {
+				continue
+			}
+			lookup[key] = append(lookup[key], candidate)
+		}
+	}
+
+	return lookup
 }
 
 // generateModifySQL generates ALTER statements
@@ -1756,6 +1824,10 @@ func filterPreDroppedViews(views []*ir.View, preDropped map[string]bool) []*ir.V
 // If they are the same, it returns just "table"
 func getTableNameWithSchema(tableSchema, tableName, targetSchema string) string {
 	quotedTable := ir.QuoteIdentifier(tableName)
+	if forceQualifiedNamesEnabled() {
+		quotedSchema := ir.QuoteIdentifier(tableSchema)
+		return fmt.Sprintf("%s.%s", quotedSchema, quotedTable)
+	}
 	if tableSchema != targetSchema {
 		quotedSchema := ir.QuoteIdentifier(tableSchema)
 		return fmt.Sprintf("%s.%s", quotedSchema, quotedTable)
@@ -1767,6 +1839,10 @@ func getTableNameWithSchema(tableSchema, tableName, targetSchema string) string 
 // If entity is in target schema, returns just the name, otherwise returns schema.name
 func qualifyEntityName(entitySchema, entityName, targetSchema string) string {
 	quotedName := ir.QuoteIdentifier(entityName)
+	if forceQualifiedNamesEnabled() {
+		quotedSchema := ir.QuoteIdentifier(entitySchema)
+		return fmt.Sprintf("%s.%s", quotedSchema, quotedName)
+	}
 	if entitySchema == targetSchema {
 		return quotedName
 	}

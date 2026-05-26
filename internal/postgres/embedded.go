@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -33,6 +34,7 @@ type EmbeddedPostgres struct {
 	password    string
 	runtimePath string
 	tempSchema  string // temporary schema name with timestamp for uniqueness
+	tempSchemas map[string]string
 }
 
 // EmbeddedPostgresConfig holds configuration for starting embedded PostgreSQL
@@ -137,17 +139,23 @@ func StartEmbeddedPostgres(config *EmbeddedPostgresConfig) (*EmbeddedPostgres, e
 		password:    config.Password,
 		runtimePath: runtimePath,
 		tempSchema:  tempSchema,
+		tempSchemas: make(map[string]string),
 	}, nil
 }
 
 // Stop stops and cleans up the embedded PostgreSQL instance
 func (ep *EmbeddedPostgres) Stop() error {
-	// Drop the temporary schema (best effort - don't fail if this errors)
-	if ep.db != nil && ep.tempSchema != "" {
+	// Drop temporary schemas (best effort - don't fail if this errors)
+	if ep.db != nil {
 		ctx := context.Background()
-		dropSchemaSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS \"%s\" CASCADE", ep.tempSchema)
-		// Ignore errors - this is best effort cleanup
-		_, _ = ep.db.ExecContext(ctx, dropSchemaSQL)
+		for _, schema := range ep.GetSchemaMapping() {
+			dropSchemaSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS \"%s\" CASCADE", schema)
+			_, _ = ep.db.ExecContext(ctx, dropSchemaSQL)
+		}
+		if ep.tempSchema != "" {
+			dropSchemaSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS \"%s\" CASCADE", ep.tempSchema)
+			_, _ = ep.db.ExecContext(ctx, dropSchemaSQL)
+		}
 	}
 
 	// Close database connection
@@ -187,10 +195,29 @@ func (ep *EmbeddedPostgres) GetSchemaName() string {
 	return ep.tempSchema
 }
 
+// GetSchemaMapping returns a copy of the target -> temporary schema mapping.
+func (ep *EmbeddedPostgres) GetSchemaMapping() map[string]string {
+	out := make(map[string]string, len(ep.tempSchemas))
+	for target, tmp := range ep.tempSchemas {
+		out[target] = tmp
+	}
+	return out
+}
+
 // ApplySchema resets a schema (drops and recreates it) and applies SQL to it.
 // This ensures a clean state before applying the desired schema definition.
 // Note: The schema parameter is ignored - we always use the temporary schema name.
 func (ep *EmbeddedPostgres) ApplySchema(ctx context.Context, schema string, sql string) error {
+	return ep.ApplySchemas(ctx, []SchemaSQLChunk{{Schema: schema, SQL: sql}})
+}
+
+// ApplySchemas materializes desired SQL into isolated temporary schemas.
+func (ep *EmbeddedPostgres) ApplySchemas(ctx context.Context, chunks []SchemaSQLChunk) error {
+	normalized := buildChunkListWithDefaults(chunks)
+	if len(normalized) == 0 {
+		return fmt.Errorf("no schema chunks provided")
+	}
+
 	// Acquire a single dedicated connection to ensure SET search_path affects
 	// all subsequent statements. Using *sql.DB (connection pool) does not
 	// guarantee the same connection across ExecContext calls, so session-scoped
@@ -201,53 +228,110 @@ func (ep *EmbeddedPostgres) ApplySchema(ctx context.Context, schema string, sql 
 	}
 	defer conn.Close()
 
-	// Drop the temporary schema if it exists (CASCADE to drop all objects)
-	dropSchemaSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS \"%s\" CASCADE", ep.tempSchema)
+	ep.tempSchemas = make(map[string]string, len(normalized))
+	for _, chunk := range normalized {
+		targetSchema := chunk.Schema
+		tempSchema := buildTempSchemaForTarget(ep.tempSchema, targetSchema)
+		ep.tempSchemas[targetSchema] = tempSchema
+	}
+
+	for _, targetSchema := range sortedSchemaKeys(ep.tempSchemas) {
+		if err := ep.resetTempSchema(ctx, conn, ep.tempSchemas[targetSchema]); err != nil {
+			return err
+		}
+	}
+
+	pending := make([]*materializationChunk, 0, len(normalized))
+	totalStatements := 0
+	for _, chunk := range normalized {
+		targetSchema := chunk.Schema
+		tempSchema := ep.tempSchemas[targetSchema]
+		preparedSQL := prepareSchemaSQLForMaterialization(chunk.SQL, targetSchema, tempSchema, ep.tempSchemas)
+		matChunk := buildMaterializationChunk(targetSchema, tempSchema, preparedSQL)
+		if !matChunk.done() {
+			pending = append(pending, matChunk)
+			totalStatements += len(matChunk.statements)
+		}
+	}
+
+	maxAttempts := totalStatements + 1
+	for attempt := 1; len(pending) > 0 && attempt <= maxAttempts; attempt++ {
+		nextPending := make([]*materializationChunk, 0, len(pending))
+		progress := false
+		var firstRetryableErr error
+
+		for _, chunk := range pending {
+			for !chunk.done() {
+				statement := chunk.statements[chunk.nextIndex]
+				err := ep.applySchemaStatement(ctx, conn, chunk.tempSchema, statement)
+				if err != nil {
+					if isRetryableMissingRelationError(err) {
+						if firstRetryableErr == nil {
+							firstRetryableErr = err
+						}
+						// Adia só o statement dependente e continua no restante do chunk.
+						nextPending = append(nextPending, buildMaterializationChunk(chunk.targetSchema, chunk.tempSchema, statement))
+						chunk.nextIndex++
+						continue
+					}
+					return fmt.Errorf("failed to apply schema SQL to temporary schema %s: %w", chunk.tempSchema, enhanceApplyError(err, statement))
+				}
+
+				chunk.nextIndex++
+				progress = true
+			}
+		}
+
+		if len(nextPending) == 0 {
+			break
+		}
+		if !progress {
+			if firstRetryableErr != nil {
+				return fmt.Errorf("failed to apply desired state SQL after %d attempt(s): %w", attempt, firstRetryableErr)
+			}
+			return fmt.Errorf("failed to apply desired state SQL after %d attempt(s): unresolved cross-schema dependencies", attempt)
+		}
+		pending = nextPending
+	}
+
+	// Keep compatibility with older call sites expecting a single schema.
+	if firstSchema := normalized[0].Schema; firstSchema != "" {
+		ep.tempSchema = ep.tempSchemas[firstSchema]
+	}
+
+	return nil
+}
+
+func (ep *EmbeddedPostgres) resetTempSchema(ctx context.Context, conn *sql.Conn, tempSchema string) error {
+	dropSchemaSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS \"%s\" CASCADE", tempSchema)
 	if _, err := util.ExecContextWithLogging(ctx, conn, dropSchemaSQL, "drop temporary schema"); err != nil {
-		return fmt.Errorf("failed to drop temporary schema %s: %w", ep.tempSchema, err)
+		return fmt.Errorf("failed to drop temporary schema %s: %w", tempSchema, err)
 	}
 
-	// Create the temporary schema
-	createSchemaSQL := fmt.Sprintf("CREATE SCHEMA \"%s\"", ep.tempSchema)
+	createSchemaSQL := fmt.Sprintf("CREATE SCHEMA \"%s\"", tempSchema)
 	if _, err := util.ExecContextWithLogging(ctx, conn, createSchemaSQL, "create temporary schema"); err != nil {
-		return fmt.Errorf("failed to create temporary schema %s: %w", ep.tempSchema, err)
+		return fmt.Errorf("failed to create temporary schema %s: %w", tempSchema, err)
 	}
 
-	// Set search_path to the temporary schema, with public as fallback
-	// for resolving extension types installed in public schema (issue #197)
-	setSearchPathSQL := fmt.Sprintf("SET search_path TO \"%s\", public", ep.tempSchema)
+	return nil
+}
+
+func (ep *EmbeddedPostgres) applySchemaStatement(ctx context.Context, conn *sql.Conn, tempSchema, statement string) error {
+	setSearchPathSQL := fmt.Sprintf("SET search_path TO \"%s\", public", tempSchema)
 	if _, err := util.ExecContextWithLogging(ctx, conn, setSearchPathSQL, "set search_path for desired state"); err != nil {
 		return fmt.Errorf("failed to set search_path: %w", err)
 	}
 
-	// Disable function body validation to avoid type-identity mismatches (issue #399).
-	// Schema qualifications inside dollar-quoted function bodies are preserved (issue #354),
-	// but parameter types are stripped. For SQL-language functions, PostgreSQL validates the
-	// body at creation time, which can fail when body references use the original schema's
-	// types while parameters reference the temporary schema's types.
 	if _, err := util.ExecContextWithLogging(ctx, conn, "SET check_function_bodies = off", "disable function body validation for desired state"); err != nil {
 		return fmt.Errorf("failed to disable check_function_bodies: %w", err)
 	}
 
-	// Strip schema qualifications from SQL before applying to temporary schema
-	// This ensures that objects are created in the temporary schema via search_path
-	// rather than being explicitly qualified with the original schema name
-	schemaAgnosticSQL := stripSchemaQualifications(sql, schema)
+	if strings.TrimSpace(statement) == "" {
+		return nil
+	}
 
-	// Replace schema names in ALTER DEFAULT PRIVILEGES statements
-	// These use "IN SCHEMA <schema>" syntax which isn't handled by stripSchemaQualifications
-	schemaAgnosticSQL = replaceSchemaInDefaultPrivileges(schemaAgnosticSQL, schema, ep.tempSchema)
-
-	// Replace schema names in SET search_path clauses within function/procedure definitions
-	// SQL-language functions are validated at creation time using the function's own search_path,
-	// so we need to rewrite it to point to the temporary schema (issue #335)
-	schemaAgnosticSQL = replaceSchemaInSearchPath(schemaAgnosticSQL, schema, ep.tempSchema)
-
-	// Execute the SQL directly
-	// Note: Desired state SQL should never contain operations like CREATE INDEX CONCURRENTLY
-	// that cannot run in transactions. Those are migration details, not state declarations.
-	if _, err := util.ExecContextWithLogging(ctx, conn, schemaAgnosticSQL, "apply desired state SQL to temporary schema"); err != nil {
-		return fmt.Errorf("failed to apply schema SQL to temporary schema %s: %w", ep.tempSchema, enhanceApplyError(err, schemaAgnosticSQL))
+	if _, err := util.ExecContextWithLogging(ctx, conn, statement, "apply desired state SQL statement to temporary schema"); err != nil {
+		return err
 	}
 
 	return nil

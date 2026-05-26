@@ -296,6 +296,60 @@ func TestStripSchemaQualifications_PreservesStringLiterals(t *testing.T) {
 	}
 }
 
+func TestReplaceManagedSchemaQualifications(t *testing.T) {
+	mapping := map[string]string{
+		"integracao": "pgschema_tmp_20260525_120000_abcd1234__integracao",
+		"comum":      "pgschema_tmp_20260525_120000_abcd1234__comum",
+	}
+
+	tests := []struct {
+		name     string
+		sql      string
+		expected string
+	}{
+		{
+			name:     "replaces unquoted cross-schema references",
+			sql:      "SELECT * FROM comum.categoria c JOIN integracao.plano p ON p.id = c.id;",
+			expected: `SELECT * FROM "pgschema_tmp_20260525_120000_abcd1234__comum".categoria c JOIN "pgschema_tmp_20260525_120000_abcd1234__integracao".plano p ON p.id = c.id;`,
+		},
+		{
+			name:     "replaces quoted schema references",
+			sql:      `SELECT * FROM "comum"."categoria" c JOIN "integracao"."plano" p ON p.id = c.id;`,
+			expected: `SELECT * FROM "pgschema_tmp_20260525_120000_abcd1234__comum"."categoria" c JOIN "pgschema_tmp_20260525_120000_abcd1234__integracao"."plano" p ON p.id = c.id;`,
+		},
+		{
+			name:     "keeps unmanaged schema unchanged",
+			sql:      "SELECT * FROM externo.referencia;",
+			expected: "SELECT * FROM externo.referencia;",
+		},
+		{
+			name:     "preserves schema-like text inside single-quoted string",
+			sql:      "SELECT 'comum.categoria' AS txt, comum.categoria FROM comum.categoria;",
+			expected: `SELECT 'comum.categoria' AS txt, "pgschema_tmp_20260525_120000_abcd1234__comum".categoria FROM "pgschema_tmp_20260525_120000_abcd1234__comum".categoria;`,
+		},
+		{
+			name: "preserves schema-like text inside comments",
+			sql:  "-- comum.categoria\nSELECT * FROM comum.categoria;",
+			expected: `-- comum.categoria
+SELECT * FROM "pgschema_tmp_20260525_120000_abcd1234__comum".categoria;`,
+		},
+		{
+			name:     "preserves schema-like text inside dollar-quoted blocks",
+			sql:      "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT 'comum.categoria'; $$;\nSELECT * FROM comum.categoria;",
+			expected: "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT 'comum.categoria'; $$;\nSELECT * FROM \"pgschema_tmp_20260525_120000_abcd1234__comum\".categoria;",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := replaceManagedSchemaQualifications(tt.sql, mapping)
+			if got != tt.expected {
+				t.Errorf("replaceManagedSchemaQualifications() mismatch\n got: %q\nwant: %q", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestEnhanceApplyError(t *testing.T) {
 	sql := "CREATE TABLE foo (id int);\nCREATE TABLE bar (\n  name text\n);\nSELECT 1;\nCREATE TABLE baz (id int);"
 
@@ -361,4 +415,93 @@ func TestEnhanceApplyError(t *testing.T) {
 			t.Errorf("expected same error instance, got: %s", result.Error())
 		}
 	})
+}
+
+func TestBuildChunkListWithDefaults(t *testing.T) {
+	chunks := []SchemaSQLChunk{
+		{Schema: "comum", SQL: "CREATE TABLE a (id int);"},
+		{Schema: "integracao", SQL: "CREATE TABLE b (id int);"},
+		{Schema: "comum", SQL: "CREATE TABLE c (id int);"},
+	}
+
+	got := buildChunkListWithDefaults(chunks)
+	expected := []SchemaSQLChunk{
+		{Schema: "comum", SQL: "CREATE TABLE a (id int);\nCREATE TABLE c (id int);"},
+		{Schema: "integracao", SQL: "CREATE TABLE b (id int);"},
+	}
+
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("buildChunkListWithDefaults() mismatch\n got: %#v\nwant: %#v", got, expected)
+	}
+}
+
+func TestBuildTempSchemaForTarget(t *testing.T) {
+	base := "pgschema_tmp_20260521_120000_abcd1234"
+	got := buildTempSchemaForTarget(base, "Comum-Data")
+	if !strings.HasPrefix(got, base+"__") {
+		t.Fatalf("expected prefix %q, got %q", base+"__", got)
+	}
+	if strings.Contains(got, "-") {
+		t.Fatalf("temp schema suffix should sanitize special chars: %q", got)
+	}
+	if len(got) > 63 {
+		t.Fatalf("temp schema should respect identifier length limit, got len=%d", len(got))
+	}
+}
+
+func TestSplitSQLStatements(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		expected []string
+	}{
+		{
+			name: "splits regular statements and keeps semicolon",
+			sql:  "CREATE TABLE t1 (id int); CREATE TABLE t2 (id int);",
+			expected: []string{
+				"CREATE TABLE t1 (id int);",
+				"CREATE TABLE t2 (id int);",
+			},
+		},
+		{
+			name: "does not split inside single-quoted strings",
+			sql:  "INSERT INTO t VALUES ('a;b');\nSELECT 1;",
+			expected: []string{
+				"INSERT INTO t VALUES ('a;b');",
+				"SELECT 1;",
+			},
+		},
+		{
+			name: "does not split inside comments",
+			sql:  "-- comment ;\nCREATE TABLE t1 (id int); /* block ; comment */\nCREATE TABLE t2 (id int);",
+			expected: []string{
+				"-- comment ;\nCREATE TABLE t1 (id int);",
+				"/* block ; comment */\nCREATE TABLE t2 (id int);",
+			},
+		},
+		{
+			name: "does not split inside dollar-quoted block",
+			sql:  "CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT 'a;b'; $$;\nCREATE TABLE t1 (id int);",
+			expected: []string{
+				"CREATE FUNCTION f() RETURNS text LANGUAGE sql AS $$ SELECT 'a;b'; $$;",
+				"CREATE TABLE t1 (id int);",
+			},
+		},
+		{
+			name: "keeps trailing statement without semicolon",
+			sql:  "CREATE TABLE t1 (id int)",
+			expected: []string{
+				"CREATE TABLE t1 (id int)",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := splitSQLStatements(tt.sql)
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Fatalf("splitSQLStatements() mismatch\n got: %#v\nwant: %#v", got, tt.expected)
+			}
+		})
+	}
 }

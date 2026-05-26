@@ -43,6 +43,7 @@ pgschema
 docs/plans/
 dist/
 build/
+.pgschema/
 
 # Logs
 *.log

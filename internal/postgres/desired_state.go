@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,15 +29,29 @@ type DesiredStateProvider interface {
 	// For external database: returns the temporary schema name (pgschema_tmp_*)
 	GetSchemaName() string
 
+	// GetSchemaMapping returns a mapping from target schema names to
+	// temporary schema names created while materializing desired state.
+	GetSchemaMapping() map[string]string
+
 	// ApplySchema applies the desired state SQL to a schema.
 	// For embedded postgres: resets the schema (drop/recreate)
 	// For external database: creates temporary schema with timestamp suffix
 	ApplySchema(ctx context.Context, schema string, sql string) error
 
+	// ApplySchemas applies schema-aware SQL chunks to isolated temporary schemas.
+	// Each target schema is materialized in its own temporary namespace.
+	ApplySchemas(ctx context.Context, chunks []SchemaSQLChunk) error
+
 	// Stop performs cleanup.
 	// For embedded postgres: stops instance and removes temp directory
 	// For external database: drops temporary schema (best effort) and closes connection
 	Stop() error
+}
+
+// SchemaSQLChunk represents desired-state SQL associated with a target schema.
+type SchemaSQLChunk struct {
+	Schema string
+	SQL    string
 }
 
 // GenerateTempSchemaName creates a unique temporary schema name for plan operations.
@@ -59,6 +74,100 @@ func GenerateTempSchemaName() string {
 	randomSuffix := hex.EncodeToString(randomBytes)
 
 	return fmt.Sprintf("pgschema_tmp_%s_%s", timestamp, randomSuffix)
+}
+
+func buildChunkListWithDefaults(chunks []SchemaSQLChunk) []SchemaSQLChunk {
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	grouped := make(map[string][]string, len(chunks))
+	order := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		schema := strings.TrimSpace(chunk.Schema)
+		if schema == "" {
+			schema = "public"
+		}
+		if _, ok := grouped[schema]; !ok {
+			order = append(order, schema)
+		}
+		grouped[schema] = append(grouped[schema], chunk.SQL)
+	}
+
+	out := make([]SchemaSQLChunk, 0, len(order))
+	for _, schema := range order {
+		sqlParts := grouped[schema]
+		out = append(out, SchemaSQLChunk{
+			Schema: schema,
+			SQL:    strings.Join(sqlParts, "\n"),
+		})
+	}
+	return out
+}
+
+func schemaNameSuffix(schema string) string {
+	normalized := strings.ToLower(strings.TrimSpace(schema))
+	if normalized == "" {
+		return "public"
+	}
+
+	var b strings.Builder
+	for _, r := range normalized {
+		isLetter := r >= 'a' && r <= 'z'
+		isDigit := r >= '0' && r <= '9'
+		if isLetter || isDigit || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	suffix := b.String()
+	if suffix == "" {
+		return "public"
+	}
+	return suffix
+}
+
+func buildTempSchemaForTarget(baseTempSchema, targetSchema string) string {
+	const maxSchemaNameLen = 63
+	suffix := schemaNameSuffix(targetSchema)
+
+	if baseTempSchema == "" {
+		baseTempSchema = GenerateTempSchemaName()
+	}
+
+	separator := "__"
+	available := maxSchemaNameLen - len(baseTempSchema) - len(separator)
+	if available <= 0 {
+		if len(baseTempSchema) > maxSchemaNameLen {
+			return baseTempSchema[:maxSchemaNameLen]
+		}
+		return baseTempSchema
+	}
+	if len(suffix) > available {
+		suffix = suffix[:available]
+	}
+
+	return baseTempSchema + separator + suffix
+}
+
+func sortedSchemaKeys(mapping map[string]string) []string {
+	keys := make([]string, 0, len(mapping))
+	for key := range mapping {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// prepareSchemaSQLForMaterialization applies all SQL rewrites required before
+// executing desired-state chunks in temporary schemas.
+func prepareSchemaSQLForMaterialization(sql, targetSchema, tempSchema string, schemaMapping map[string]string) string {
+	schemaAgnosticSQL := stripSchemaQualifications(sql, targetSchema)
+	schemaAgnosticSQL = replaceSchemaInDefaultPrivileges(schemaAgnosticSQL, targetSchema, tempSchema)
+	schemaAgnosticSQL = replaceSchemaInSearchPath(schemaAgnosticSQL, targetSchema, tempSchema)
+	schemaAgnosticSQL = replaceManagedSchemaQualifications(schemaAgnosticSQL, schemaMapping)
+	return schemaAgnosticSQL
 }
 
 // stripSchemaQualifications removes schema qualifications from SQL statements for the specified target schema.
@@ -126,13 +235,306 @@ func stripSchemaQualifications(sql string, schemaName string) string {
 	return result.String()
 }
 
+// replaceManagedSchemaQualifications rewrites schema-qualified references for all managed
+// target schemas to their temporary materialized schema names.
+//
+// Example:
+// - comum.table -> pgschema_tmp_xxx__comum.table
+// - "comum"."table" -> "pgschema_tmp_xxx__comum"."table"
+//
+// Similar to stripSchemaQualifications, this function preserves single-quoted string literals,
+// SQL comments, and dollar-quoted blocks.
+func replaceManagedSchemaQualifications(sql string, schemaMapping map[string]string) string {
+	if len(schemaMapping) == 0 {
+		return sql
+	}
+
+	segments := splitDollarQuotedSegments(sql)
+	var result strings.Builder
+	result.Grow(len(sql))
+	for _, seg := range segments {
+		if seg.quoted {
+			result.WriteString(seg.text)
+		} else {
+			result.WriteString(replaceManagedSchemaQualificationsPreservingStrings(seg.text, schemaMapping))
+		}
+	}
+	return result.String()
+}
+
+func replaceManagedSchemaQualificationsPreservingStrings(text string, schemaMapping map[string]string) string {
+	var result strings.Builder
+	result.Grow(len(text))
+
+	i := 0
+	segStart := 0
+
+	flushCode := func(end int) {
+		if end > segStart {
+			result.WriteString(replaceManagedSchemaQualificationsFromText(text[segStart:end], schemaMapping))
+		}
+		segStart = end
+	}
+	flushLiteral := func(end int) {
+		result.WriteString(text[segStart:end])
+		segStart = end
+	}
+
+	for i < len(text) {
+		ch := text[i]
+
+		if ch == '\'' {
+			flushCode(i)
+			i++
+			for i < len(text) {
+				if text[i] == '\'' {
+					if i+1 < len(text) && text[i+1] == '\'' {
+						i += 2
+					} else {
+						i++
+						break
+					}
+				} else {
+					i++
+				}
+			}
+			flushLiteral(i)
+			continue
+		}
+
+		if ch == '-' && i+1 < len(text) && text[i+1] == '-' {
+			flushCode(i)
+			i += 2
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+			if i < len(text) {
+				i++
+			}
+			flushLiteral(i)
+			continue
+		}
+
+		if ch == '/' && i+1 < len(text) && text[i+1] == '*' {
+			flushCode(i)
+			i += 2
+			for i < len(text) {
+				if text[i] == '*' && i+1 < len(text) && text[i+1] == '/' {
+					i += 2
+					break
+				}
+				i++
+			}
+			flushLiteral(i)
+			continue
+		}
+
+		i++
+	}
+
+	flushCode(i)
+	return result.String()
+}
+
+func replaceManagedSchemaQualificationsFromText(text string, schemaMapping map[string]string) string {
+	if len(schemaMapping) == 0 || text == "" {
+		return text
+	}
+
+	keys := sortedSchemaKeys(schemaMapping)
+	result := text
+	for _, targetSchema := range keys {
+		tempSchema := schemaMapping[targetSchema]
+		if targetSchema == "" || tempSchema == "" || targetSchema == tempSchema {
+			continue
+		}
+
+		result = strings.ReplaceAll(
+			result,
+			fmt.Sprintf(`"%s".`, targetSchema),
+			fmt.Sprintf(`"%s".`, tempSchema),
+		)
+
+		pattern := regexp.MustCompile(
+			fmt.Sprintf(`(?i)(^|[^a-zA-Z0-9_$"])%s\.`, regexp.QuoteMeta(targetSchema)),
+		)
+		result = pattern.ReplaceAllString(result, fmt.Sprintf(`${1}"%s".`, tempSchema))
+	}
+
+	return result
+}
+
+func isRetryableMissingRelationError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if pgErr.Code == "42P01" {
+			return true
+		}
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "relation") && strings.Contains(msg, "does not exist")
+}
+
+type materializationChunk struct {
+	targetSchema string
+	tempSchema   string
+	statements   []string
+	nextIndex    int
+}
+
+func buildMaterializationChunk(targetSchema, tempSchema, sql string) *materializationChunk {
+	statements := splitSQLStatements(sql)
+	return &materializationChunk{
+		targetSchema: targetSchema,
+		tempSchema:   tempSchema,
+		statements:   statements,
+		nextIndex:    0,
+	}
+}
+
+func (c *materializationChunk) done() bool {
+	return c == nil || c.nextIndex >= len(c.statements)
+}
+
+func splitSQLStatements(sql string) []string {
+	text := strings.TrimSpace(sql)
+	if text == "" {
+		return nil
+	}
+
+	var statements []string
+	start := 0
+
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	inBlockComment := false
+	dollarTag := ""
+
+	for i := 0; i < len(sql); i++ {
+		ch := sql[i]
+
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && i+1 < len(sql) && sql[i+1] == '/' {
+				inBlockComment = false
+				i++
+			}
+			continue
+		}
+		if dollarTag != "" {
+			if strings.HasPrefix(sql[i:], dollarTag) {
+				i += len(dollarTag) - 1
+				dollarTag = ""
+			}
+			continue
+		}
+		if inSingle {
+			if ch == '\'' {
+				if i+1 < len(sql) && sql[i+1] == '\'' {
+					i++
+				} else {
+					inSingle = false
+				}
+			}
+			continue
+		}
+		if inDouble {
+			if ch == '"' {
+				if i+1 < len(sql) && sql[i+1] == '"' {
+					i++
+				} else {
+					inDouble = false
+				}
+			}
+			continue
+		}
+
+		if ch == '\'' {
+			inSingle = true
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			continue
+		}
+		if ch == '-' && i+1 < len(sql) && sql[i+1] == '-' {
+			inLineComment = true
+			i++
+			continue
+		}
+		if ch == '/' && i+1 < len(sql) && sql[i+1] == '*' {
+			inBlockComment = true
+			i++
+			continue
+		}
+		if ch == '$' {
+			if tag, ok := scanDollarTag(sql, i); ok {
+				dollarTag = tag
+				i += len(tag) - 1
+				continue
+			}
+		}
+		if ch == ';' {
+			statement := strings.TrimSpace(sql[start : i+1])
+			if statement != "" {
+				statements = append(statements, statement)
+			}
+			start = i + 1
+		}
+	}
+
+	if start < len(sql) {
+		tail := strings.TrimSpace(sql[start:])
+		if tail != "" {
+			statements = append(statements, tail)
+		}
+	}
+
+	return statements
+}
+
+func scanDollarTag(sql string, start int) (string, bool) {
+	if start >= len(sql) || sql[start] != '$' {
+		return "", false
+	}
+
+	end := strings.IndexByte(sql[start+1:], '$')
+	if end == -1 {
+		return "", false
+	}
+	end += start + 1
+	tag := sql[start : end+1]
+
+	inner := tag[1 : len(tag)-1]
+	if inner == "" {
+		return "$$", true
+	}
+	if (inner[0] >= 'a' && inner[0] <= 'z') || (inner[0] >= 'A' && inner[0] <= 'Z') || inner[0] == '_' {
+		for i := 1; i < len(inner); i++ {
+			c := inner[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+				return "", false
+			}
+		}
+		return tag, true
+	}
+	return "", false
+}
+
 // stripSchemaQualificationsPreservingStrings splits text on single-quoted string
 // literals and SQL comments, applies schema stripping only to non-string,
 // non-comment parts, and reassembles.
 //
 // Limitation: E'...' escape-string syntax uses backslash-escaped quotes (E'it\'s')
-// rather than doubled quotes ('it''s'). This parser only recognises the '' form.
-// With E'content\'', a backslash-escaped quote may cause the parser to mistrack
+// rather than doubled quotes ('it”s'). This parser only recognises the ” form.
+// With E'content\”, a backslash-escaped quote may cause the parser to mistrack
 // string boundaries, which can result in either:
 //   - false-negative: schema qualifiers after the string are not stripped, or
 //   - false-positive: schema prefixes inside the E-string are incorrectly stripped.
