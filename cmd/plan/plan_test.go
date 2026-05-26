@@ -4,8 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/pgplex/pgschema/internal/include"
+	"github.com/pgplex/pgschema/internal/postgres"
+	"github.com/pgplex/pgschema/ir"
 	"github.com/spf13/cobra"
 )
 
@@ -197,5 +202,162 @@ func TestPlanCommandFileError(t *testing.T) {
 	err := runPlan(PlanCmd, []string{})
 	if err == nil {
 		t.Error("Expected error when file doesn't exist, but got none")
+	}
+}
+
+func TestBuildSchemaChunksForPlan(t *testing.T) {
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "schema.bundle.sql")
+
+	planSchemas := []string{"integracao", "comum"}
+	chunks := []include.ProcessedChunk{
+		{
+			SourcePath: filepath.Join(tempDir, "integracao", "schema.sql"),
+			Content:    "CREATE TABLE objetivo_desenvolvimento_sustentavel (id bigint primary key);",
+		},
+		{
+			SourcePath: filepath.Join(tempDir, "comum", "schema.sql"),
+			Content:    "CREATE TABLE objetivo_desenvolvimento_sustentavel (id bigint primary key, id_objetivo_desenvolvimento_sustentavel bigint);",
+		},
+		{
+			SourcePath: filePath,
+			Content:    "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
+		},
+	}
+
+	got, err := buildSchemaChunksForPlan(filePath, planSchemas, chunks)
+	if err != nil {
+		t.Fatalf("buildSchemaChunksForPlan returned error: %v", err)
+	}
+
+	expected := []postgres.SchemaSQLChunk{
+		{
+			Schema: "integracao",
+			SQL:    "CREATE TABLE objetivo_desenvolvimento_sustentavel (id bigint primary key);\nCREATE EXTENSION IF NOT EXISTS pg_trgm;",
+		},
+		{
+			Schema: "comum",
+			SQL:    "CREATE TABLE objetivo_desenvolvimento_sustentavel (id bigint primary key, id_objetivo_desenvolvimento_sustentavel bigint);",
+		},
+	}
+
+	if !reflect.DeepEqual(got, expected) {
+		t.Fatalf("unexpected schema chunks:\n got: %#v\nwant: %#v", got, expected)
+	}
+}
+
+func TestInferSchemaFromChunkPath(t *testing.T) {
+	planSchemas := []string{"integracao", "comum"}
+	baseDir := filepath.Join(string(os.PathSeparator), "tmp", "desired")
+
+	tests := []struct {
+		name       string
+		sourcePath string
+		expected   string
+	}{
+		{
+			name:       "matches first segment schema",
+			sourcePath: filepath.Join(baseDir, "comum", "schema.sql"),
+			expected:   "comum",
+		},
+		{
+			name:       "fallback to primary on unknown segment",
+			sourcePath: filepath.Join(baseDir, "shared", "extensions.sql"),
+			expected:   "integracao",
+		},
+		{
+			name:       "fallback to primary on empty source path",
+			sourcePath: "",
+			expected:   "integracao",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := inferSchemaFromChunkPath(baseDir, tt.sourcePath, planSchemas, "integracao")
+			if got != tt.expected {
+				t.Fatalf("inferSchemaFromChunkPath() = %q, want %q", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizeSchemaNames_NormalizesCrossSchemaFKReference(t *testing.T) {
+	tempIntegracao := "pgschema_tmp_20260525_170911_dd10fcf9__integracao"
+	tempComum := "pgschema_tmp_20260525_170911_dd10fcf9__comum"
+
+	irData := &ir.IR{
+		Schemas: map[string]*ir.Schema{
+			tempIntegracao: {
+				Name: tempIntegracao,
+				Tables: map[string]*ir.Table{
+					"participante": {
+						Schema: tempIntegracao,
+						Name:   "participante",
+						Constraints: map[string]*ir.Constraint{
+							"fk_valor_referencial_maximo_bolsa": {
+								Name:            "fk_valor_referencial_maximo_bolsa",
+								Type:            ir.ConstraintTypeForeignKey,
+								ReferencedTable: tempComum + ".valor_referencial_maximo_bolsa",
+							},
+						},
+					},
+				},
+			},
+			tempComum: {
+				Name: tempComum,
+				Tables: map[string]*ir.Table{
+					"valor_referencial_maximo_bolsa": {
+						Schema: tempComum,
+						Name:   "valor_referencial_maximo_bolsa",
+					},
+				},
+			},
+		},
+	}
+
+	normalizeSchemaNames(irData, tempIntegracao, "integracao")
+	normalizeSchemaNames(irData, tempComum, "comum")
+
+	constraint := irData.Schemas["integracao"].Tables["participante"].Constraints["fk_valor_referencial_maximo_bolsa"]
+	if constraint.ReferencedSchema != "comum" {
+		t.Fatalf("expected referenced schema to be comum, got %q", constraint.ReferencedSchema)
+	}
+	if constraint.ReferencedTable != "valor_referencial_maximo_bolsa" {
+		t.Fatalf("expected referenced table to be valor_referencial_maximo_bolsa, got %q", constraint.ReferencedTable)
+	}
+}
+
+func TestNormalizeSchemaNames_NormalizesCrossSchemaViewReference(t *testing.T) {
+	tempIntegracao := "pgschema_tmp_20260525_172323_e46d8344__integracao"
+	tempComum := "pgschema_tmp_20260525_172323_e46d8344__comum"
+
+	irData := &ir.IR{
+		Schemas: map[string]*ir.Schema{
+			tempIntegracao: {
+				Name: tempIntegracao,
+				Views: map[string]*ir.View{
+					"curso": {
+						Schema:     tempIntegracao,
+						Name:       "curso",
+						Definition: "SELECT c.id FROM curso_sigaa c LEFT JOIN " + tempComum + ".categoria_plano_trabalho cpt ON cpt.id = c.id_curso",
+					},
+				},
+			},
+			tempComum: {
+				Name: tempComum,
+			},
+		},
+	}
+
+	normalizeSchemaNames(irData, tempIntegracao, "integracao")
+	normalizeSchemaNames(irData, tempComum, "comum")
+
+	view := irData.Schemas["integracao"].Views["curso"]
+	if strings.Contains(view.Definition, "pgschema_tmp_") {
+		t.Fatalf("expected view definition to not contain temporary schema, got %q", view.Definition)
+	}
+	if !strings.Contains(view.Definition, "comum.categoria_plano_trabalho") {
+		t.Fatalf("expected view definition to reference comum schema, got %q", view.Definition)
 	}
 }

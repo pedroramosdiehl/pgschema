@@ -278,9 +278,13 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 
 	// Process desired state file with include directives
 	processor := include.NewProcessor(filepath.Dir(config.File))
-	desiredState, err := processor.ProcessFile(config.File)
+	desiredChunks, err := processor.ProcessFileWithChunks(config.File)
 	if err != nil {
 		return nil, fmt.Errorf("failed to process desired state schema file: %w", err)
+	}
+	schemaChunks, err := buildSchemaChunksForPlan(config.File, planSchemas, desiredChunks)
+	if err != nil {
+		return nil, fmt.Errorf("failed to classify desired state schema chunks: %w", err)
 	}
 
 	// Get current state from target database
@@ -298,24 +302,32 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 	ctx := context.Background()
 
 	// Apply desired state SQL to the provider (embedded postgres or external database)
-	if err := provider.ApplySchema(ctx, primarySchema, desiredState); err != nil {
+	if err := provider.ApplySchemas(ctx, schemaChunks); err != nil {
 		return nil, fmt.Errorf("failed to apply desired state: %w", err)
 	}
 
 	// Inspect the provider database to get desired state IR
 	providerHost, providerPort, providerDB, providerUsername, providerPassword := provider.GetConnectionDetails()
 
-	// Get the temporary schema name where desired state SQL was applied.
-	// Both embedded and external database providers use temporary schemas with unique timestamps
-	// (e.g., pgschema_tmp_20251030_154501_123456789) to ensure isolation and prevent conflicts.
-	schemaToInspect := provider.GetSchemaName()
-	if schemaToInspect == "" {
-		schemaToInspect = primarySchema
+	// Resolve temporary schema mapping and inspect all materialized schemas.
+	schemaMapping := provider.GetSchemaMapping()
+	if len(schemaMapping) == 0 {
+		schemaToInspect := provider.GetSchemaName()
+		if schemaToInspect == "" {
+			schemaToInspect = primarySchema
+		}
+		schemaMapping = map[string]string{
+			primarySchema: schemaToInspect,
+		}
 	}
 
-	inspectSchemas := []string{schemaToInspect}
-	for _, s := range planSchemas[1:] {
-		inspectSchemas = append(inspectSchemas, s)
+	inspectSchemas := make([]string, 0, len(planSchemas))
+	for _, schema := range planSchemas {
+		tmpSchema, ok := schemaMapping[schema]
+		if !ok || tmpSchema == "" {
+			return nil, fmt.Errorf("missing temporary schema mapping for target schema %q", schema)
+		}
+		inspectSchemas = append(inspectSchemas, tmpSchema)
 	}
 	inspectSpec := strings.Join(inspectSchemas, ",")
 
@@ -333,22 +345,77 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 		return nil, fmt.Errorf("failed to get desired state: %w", err)
 	}
 
-	// Normalize schema names in the IR from temporary schema to target schema.
-	// At this point, the IR contains schema names like "pgschema_tmp_20251030_154501_123456789"
-	// because that's where objects were created. We need to replace these with the target
-	// schema name (e.g., "public") so that generated DDL references the correct schema.
-	// Without this normalization, DDL would reference non-existent temporary schemas and fail.
-	if schemaToInspect != primarySchema {
-		normalizeSchemaNames(desiredStateIR, schemaToInspect, primarySchema)
+	// Normalize schema names in the IR from temporary schema names back to target names.
+	for _, targetSchema := range planSchemas {
+		tempSchema := schemaMapping[targetSchema]
+		if tempSchema != targetSchema {
+			normalizeSchemaNames(desiredStateIR, tempSchema, targetSchema)
+		}
 	}
 
 	// Generate diff (current -> desired) using IR directly
-	diffs := diff.GenerateMigration(currentStateIR, desiredStateIR, primarySchema)
+	diffs := diff.GenerateMigrationWithOptions(currentStateIR, desiredStateIR, primarySchema, diff.GenerateOptions{
+		ForceQualifiedNames: len(planSchemas) > 1,
+	})
 
 	// Create plan from diffs with fingerprint
 	migrationPlan := plan.NewPlanWithFingerprint(diffs, sourceFingerprint)
 
 	return migrationPlan, nil
+}
+
+func buildSchemaChunksForPlan(filePath string, planSchemas []string, chunks []include.ProcessedChunk) ([]postgres.SchemaSQLChunk, error) {
+	absFile, err := filepath.Abs(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve desired state file path: %w", err)
+	}
+
+	baseDir := filepath.Dir(absFile)
+	primarySchema := planSchemas[0]
+
+	sqlBySchema := make(map[string][]string, len(planSchemas))
+	for _, schema := range planSchemas {
+		sqlBySchema[schema] = nil
+	}
+
+	for _, chunk := range chunks {
+		targetSchema := inferSchemaFromChunkPath(baseDir, chunk.SourcePath, planSchemas, primarySchema)
+		sqlBySchema[targetSchema] = append(sqlBySchema[targetSchema], chunk.Content)
+	}
+
+	out := make([]postgres.SchemaSQLChunk, 0, len(planSchemas))
+	for _, schema := range planSchemas {
+		out = append(out, postgres.SchemaSQLChunk{
+			Schema: schema,
+			SQL:    strings.Join(sqlBySchema[schema], "\n"),
+		})
+	}
+
+	return out, nil
+}
+
+func inferSchemaFromChunkPath(baseDir, sourcePath string, planSchemas []string, primarySchema string) string {
+	if sourcePath == "" {
+		return primarySchema
+	}
+
+	rel, err := filepath.Rel(baseDir, sourcePath)
+	if err != nil {
+		return primarySchema
+	}
+
+	segments := strings.Split(filepath.Clean(rel), string(filepath.Separator))
+	if len(segments) == 0 {
+		return primarySchema
+	}
+	firstSegment := segments[0]
+	for _, schema := range planSchemas {
+		if firstSegment == schema {
+			return schema
+		}
+	}
+
+	return primarySchema
 }
 
 // outputSpec represents a single output specification
@@ -485,10 +552,7 @@ func normalizeSchemaNames(irData *ir.IR, fromSchema, toSchema string) {
 				if constraint.Schema == fromSchema {
 					constraint.Schema = toSchema
 				}
-				// Normalize referenced schema in foreign key constraints
-				if constraint.ReferencedSchema == fromSchema {
-					constraint.ReferencedSchema = toSchema
-				}
+				normalizeConstraintReference(constraint, fromSchema, toSchema, replaceString)
 				constraint.CheckClause = stripQualifiers(replaceString(constraint.CheckClause))
 			}
 
@@ -627,6 +691,87 @@ func normalizeSchemaNames(irData *ir.IR, fromSchema, toSchema string) {
 			}
 		}
 	}
+
+	// Cross-schema references can live in objects outside the currently renamed schema.
+	// Ensure cross-schema references to fromSchema are normalized everywhere in the IR.
+	for _, schema := range irData.Schemas {
+		for _, table := range schema.Tables {
+			for _, constraint := range table.Constraints {
+				normalizeConstraintReference(constraint, fromSchema, toSchema, replaceString)
+			}
+		}
+		for _, view := range schema.Views {
+			view.Definition = replaceString(view.Definition)
+			for _, index := range view.Indexes {
+				index.Where = replaceString(index.Where)
+			}
+			for _, trigger := range view.Triggers {
+				trigger.Function = stripQualifiers(replaceString(trigger.Function))
+				trigger.Condition = stripQualifiers(replaceString(trigger.Condition))
+			}
+		}
+	}
+}
+
+func normalizeConstraintReference(
+	constraint *ir.Constraint,
+	fromSchema string,
+	toSchema string,
+	replaceString func(string) string,
+) {
+	if constraint == nil {
+		return
+	}
+
+	if constraint.ReferencedSchema == fromSchema {
+		constraint.ReferencedSchema = toSchema
+	}
+
+	constraint.ReferencedTable = replaceString(constraint.ReferencedTable)
+
+	// Guard for legacy/edge introspection cases where referenced table may carry
+	// an embedded schema qualification in ReferencedTable instead of ReferencedSchema.
+	if constraint.ReferencedSchema == "" {
+		if schemaName, tableName, ok := splitQualifiedRelationName(constraint.ReferencedTable); ok {
+			constraint.ReferencedSchema = schemaName
+			constraint.ReferencedTable = tableName
+		}
+	}
+}
+
+func splitQualifiedRelationName(value string) (string, string, bool) {
+	s := strings.TrimSpace(value)
+	if s == "" {
+		return "", "", false
+	}
+
+	// "schema"."table"
+	if strings.HasPrefix(s, `"`) {
+		endFirst := strings.Index(s[1:], `"`)
+		if endFirst == -1 {
+			return "", "", false
+		}
+		endFirst += 1
+		if endFirst+2 >= len(s) || s[endFirst+1] != '.' || s[endFirst+2] != '"' {
+			return "", "", false
+		}
+		rest := s[endFirst+3:]
+		endSecond := strings.Index(rest, `"`)
+		if endSecond == -1 || endSecond != len(rest)-1 {
+			return "", "", false
+		}
+		return s[1:endFirst], rest[:endSecond], true
+	}
+
+	// schema.table
+	parts := strings.Split(s, ".")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	if parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 // newSchemaStringReplacer creates a string replacement function for normalizing schema names.

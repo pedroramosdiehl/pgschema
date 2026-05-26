@@ -667,3 +667,81 @@ func TestProcessFile_MatchesPreGeneratedSchema(t *testing.T) {
 		}
 	}
 }
+
+func TestProcessFileWithChunks_PreservesSourcePaths(t *testing.T) {
+	tempDir := t.TempDir()
+
+	mainFile := filepath.Join(tempDir, "schema.bundle.sql")
+	if err := os.WriteFile(mainFile, []byte("\\i integracao/schema.sql\n\\i comum/schema.sql\n"), 0644); err != nil {
+		t.Fatalf("failed to write main file: %v", err)
+	}
+
+	integracaoDir := filepath.Join(tempDir, "integracao")
+	comumDir := filepath.Join(tempDir, "comum")
+	if err := os.MkdirAll(integracaoDir, 0755); err != nil {
+		t.Fatalf("failed to create integracao dir: %v", err)
+	}
+	if err := os.MkdirAll(comumDir, 0755); err != nil {
+		t.Fatalf("failed to create comum dir: %v", err)
+	}
+
+	integracaoFile := filepath.Join(integracaoDir, "schema.sql")
+	comumFile := filepath.Join(comumDir, "schema.sql")
+	if err := os.WriteFile(integracaoFile, []byte("CREATE TABLE objetivo_desenvolvimento_sustentavel (id bigint primary key);\n"), 0644); err != nil {
+		t.Fatalf("failed to write integracao file: %v", err)
+	}
+	if err := os.WriteFile(comumFile, []byte("CREATE TABLE objetivo_desenvolvimento_sustentavel (id bigint primary key, id_objetivo_desenvolvimento_sustentavel bigint);\n"), 0644); err != nil {
+		t.Fatalf("failed to write comum file: %v", err)
+	}
+
+	processor := NewProcessor(tempDir)
+	chunks, err := processor.ProcessFileWithChunks(mainFile)
+	if err != nil {
+		t.Fatalf("ProcessFileWithChunks failed: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(chunks))
+	}
+
+	if chunks[0].SourcePath != integracaoFile {
+		t.Fatalf("unexpected first chunk source path: %s", chunks[0].SourcePath)
+	}
+	if chunks[1].SourcePath != comumFile {
+		t.Fatalf("unexpected second chunk source path: %s", chunks[1].SourcePath)
+	}
+}
+
+func TestProcessFileWithChunks_MainFileContentKeepsMainSource(t *testing.T) {
+	tempDir := t.TempDir()
+
+	mainFile := filepath.Join(tempDir, "schema.sql")
+	mainSQL := "CREATE SCHEMA IF NOT EXISTS public;\n\\i parts/table.sql\nCREATE EXTENSION IF NOT EXISTS pg_trgm;\n"
+	if err := os.WriteFile(mainFile, []byte(mainSQL), 0644); err != nil {
+		t.Fatalf("failed to write main file: %v", err)
+	}
+
+	partsDir := filepath.Join(tempDir, "parts")
+	if err := os.MkdirAll(partsDir, 0755); err != nil {
+		t.Fatalf("failed to create parts dir: %v", err)
+	}
+	partFile := filepath.Join(partsDir, "table.sql")
+	if err := os.WriteFile(partFile, []byte("CREATE TABLE users (id bigint primary key);\n"), 0644); err != nil {
+		t.Fatalf("failed to write part file: %v", err)
+	}
+
+	processor := NewProcessor(tempDir)
+	chunks, err := processor.ProcessFileWithChunks(mainFile)
+	if err != nil {
+		t.Fatalf("ProcessFileWithChunks failed: %v", err)
+	}
+
+	if len(chunks) != 3 {
+		t.Fatalf("expected 3 chunks, got %d", len(chunks))
+	}
+	if chunks[0].SourcePath != mainFile || chunks[2].SourcePath != mainFile {
+		t.Fatalf("main file chunks should preserve main source path")
+	}
+	if chunks[1].SourcePath != partFile {
+		t.Fatalf("included file chunk should preserve included source path")
+	}
+}

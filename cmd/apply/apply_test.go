@@ -541,3 +541,25 @@ func TestApplyCommand_PlanDatabaseFlags(t *testing.T) {
 		t.Errorf("Expected default plan-password to be empty, got '%s'", planPasswordFlag.DefValue)
 	}
 }
+
+func TestResolvePrimarySchema(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{name: "single schema", input: "integracao", expect: "integracao"},
+		{name: "multi schema csv", input: "integracao,comum", expect: "integracao"},
+		{name: "multi schema with spaces", input: " integracao , comum ", expect: "integracao"},
+		{name: "empty uses public", input: "", expect: "public"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolvePrimarySchema(tt.input)
+			if got != tt.expect {
+				t.Fatalf("resolvePrimarySchema(%q) = %q, want %q", tt.input, got, tt.expect)
+			}
+		})
+	}
+}

@@ -399,6 +399,7 @@ func generateCreateTablesSQL(
 	targetSchema string,
 	collector *diffCollector,
 	existingTables map[string]bool,
+	referencedConstraintsAddedInModify map[string][]*ir.Constraint,
 	shouldDeferPolicy func(*ir.RLSPolicy) bool,
 ) ([]*ir.RLSPolicy, []*deferredConstraint) {
 	var deferredPolicies []*ir.RLSPolicy
@@ -408,7 +409,7 @@ func generateCreateTablesSQL(
 	// Process tables in the provided order (already topologically sorted)
 	for _, table := range tables {
 		// Create the table, deferring FK constraints that reference not-yet-created tables
-		sql, tableDeferred := generateTableSQL(table, targetSchema, createdTables, existingTables)
+		sql, tableDeferred := generateTableSQL(table, targetSchema, createdTables, existingTables, referencedConstraintsAddedInModify)
 		deferredConstraints = append(deferredConstraints, tableDeferred...)
 
 		// Create context for this statement
@@ -586,9 +587,14 @@ func generateDropTablesSQL(tables []*ir.Table, targetSchema string, collector *d
 }
 
 // generateTableSQL generates CREATE TABLE statement and returns any deferred FK constraints
-func generateTableSQL(table *ir.Table, targetSchema string, createdTables map[string]bool, existingTables map[string]bool) (string, []*deferredConstraint) {
-	// Only include table name without schema if it's in the target schema
-	tableName := ir.QualifyEntityNameWithQuotes(table.Schema, table.Name, targetSchema)
+func generateTableSQL(
+	table *ir.Table,
+	targetSchema string,
+	createdTables map[string]bool,
+	existingTables map[string]bool,
+	referencedConstraintsAddedInModify map[string][]*ir.Constraint,
+) (string, []*deferredConstraint) {
+	tableName := qualifyEntityName(table.Schema, table.Name, targetSchema)
 
 	var parts []string
 	createPrefix := "CREATE TABLE IF NOT EXISTS"
@@ -608,7 +614,7 @@ func generateTableSQL(table *ir.Table, targetSchema string, createdTables map[st
 
 	// Add LIKE clauses
 	for _, likeClause := range table.LikeClauses {
-		likeTableName := ir.QualifyEntityNameWithQuotes(likeClause.SourceSchema, likeClause.SourceTable, targetSchema)
+		likeTableName := qualifyEntityName(likeClause.SourceSchema, likeClause.SourceTable, targetSchema)
 		likeSQL := fmt.Sprintf("LIKE %s", likeTableName)
 		if likeClause.Options != "" {
 			likeSQL += " " + likeClause.Options
@@ -621,7 +627,7 @@ func generateTableSQL(table *ir.Table, targetSchema string, createdTables map[st
 	var deferred []*deferredConstraint
 	currentKey := fmt.Sprintf("%s.%s", table.Schema, table.Name)
 	for _, constraint := range inlineConstraints {
-		if shouldDeferConstraint(table, constraint, currentKey, createdTables, existingTables) {
+		if shouldDeferConstraint(table, constraint, currentKey, createdTables, existingTables, referencedConstraintsAddedInModify) {
 			deferred = append(deferred, &deferredConstraint{
 				table:      table,
 				constraint: constraint,
@@ -646,7 +652,14 @@ func generateTableSQL(table *ir.Table, targetSchema string, createdTables map[st
 	return strings.Join(parts, "\n"), deferred
 }
 
-func shouldDeferConstraint(table *ir.Table, constraint *ir.Constraint, currentKey string, createdTables map[string]bool, existingTables map[string]bool) bool {
+func shouldDeferConstraint(
+	table *ir.Table,
+	constraint *ir.Constraint,
+	currentKey string,
+	createdTables map[string]bool,
+	existingTables map[string]bool,
+	referencedConstraintsAddedInModify map[string][]*ir.Constraint,
+) bool {
 	if constraint == nil || constraint.Type != ir.ConstraintTypeForeignKey {
 		return false
 	}
@@ -662,17 +675,60 @@ func shouldDeferConstraint(table *ir.Table, constraint *ir.Constraint, currentKe
 	if refKey == currentKey {
 		return false
 	}
-
-	// Check if the referenced table exists (either being created or already exists)
-	if existingTables != nil && existingTables[refKey] {
-		return false // Table exists, no need to defer
+	// Em cenários multi-schema, mantemos FK no flush final para garantir
+	// ordenação estável após CREATE/MODIFY de todos os schemas.
+	if refSchema != table.Schema {
+		return true
 	}
+
 	if createdTables != nil && createdTables[refKey] {
 		return false // Table already created in this operation
+	}
+	if shouldDeferForReferencedConstraintAddedInModify(refKey, constraint, referencedConstraintsAddedInModify) {
+		return true
+	}
+	// Mesmo com a tabela já existente, a FK pode falhar se a chave referenciada
+	// (PK/UNIQUE) só for criada na fase MODIFY do mesmo migration.
+	if existingTables != nil && existingTables[refKey] {
+		return false
 	}
 
 	// Referenced table doesn't exist yet, defer the constraint
 	return true
+}
+
+func shouldDeferForReferencedConstraintAddedInModify(
+	referencedTableKey string,
+	fkConstraint *ir.Constraint,
+	referencedConstraintsAddedInModify map[string][]*ir.Constraint,
+) bool {
+	if fkConstraint == nil || len(referencedConstraintsAddedInModify) == 0 {
+		return false
+	}
+
+	addedConstraints := referencedConstraintsAddedInModify[referencedTableKey]
+	if len(addedConstraints) == 0 {
+		return false
+	}
+
+	for _, candidate := range addedConstraints {
+		if candidate == nil {
+			continue
+		}
+		if candidate.Type != ir.ConstraintTypePrimaryKey && candidate.Type != ir.ConstraintTypeUnique {
+			continue
+		}
+
+		// Quando a FK não explicita colunas referenciadas, PostgreSQL usa a PK.
+		if len(fkConstraint.ReferencedColumns) == 0 && candidate.Type == ir.ConstraintTypePrimaryKey {
+			return true
+		}
+		if constraintMatchesFKReference(candidate, fkConstraint) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // constraintDroppedWithColumns reports whether dropping any column in droppedColumnSet

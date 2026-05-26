@@ -39,7 +39,7 @@ func generateConstraintSQL(constraint *ir.Constraint, targetSchema string) strin
 		return fmt.Sprintf("CONSTRAINT %s UNIQUE%s (%s)", ir.QuoteIdentifier(constraint.Name), modifier, strings.Join(cols, ", "))
 	case ir.ConstraintTypeForeignKey:
 		// Always include CONSTRAINT name to preserve explicit FK names
-		// Use QualifyEntityNameWithQuotes to add schema qualifier when referencing tables in other schemas
+		// Use shared qualifier helper so multi-schema mode can force schema qualification.
 		cols := getColumnNames(constraint.Columns)
 		refCols := getColumnNames(constraint.ReferencedColumns)
 		if constraint.IsTemporal {
@@ -50,7 +50,7 @@ func generateConstraintSQL(constraint *ir.Constraint, targetSchema string) strin
 				refCols[len(refCols)-1] = "PERIOD " + refCols[len(refCols)-1]
 			}
 		}
-		qualifiedRefTable := ir.QualifyEntityNameWithQuotes(constraint.ReferencedSchema, constraint.ReferencedTable, targetSchema)
+		qualifiedRefTable := qualifyEntityName(constraint.ReferencedSchema, constraint.ReferencedTable, targetSchema)
 		stmt := fmt.Sprintf("CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
 			ir.QuoteIdentifier(constraint.Name),
 			strings.Join(cols, ", "),

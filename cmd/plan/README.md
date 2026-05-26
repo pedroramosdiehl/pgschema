@@ -21,6 +21,40 @@ pgschema plan \
 
 Optional **plan database** (instead of the default embedded Postgres): `--plan-host`, `--plan-port`, `--plan-db`, `--plan-user`, `--plan-password`, `--plan-sslmode`, or `PGSCHEMA_PLAN_*` env vars. See the main project docs for details.
 
+## How plan works
+
+`pgschema plan` is inspector-based on both sides:
+
+1. **Read current state from target database**  
+   The schema(s) from `--schema` are introspected directly from the target DB.
+
+2. **Materialize desired state on a provider database**  
+   Your `--file` (including `\i` chunks) is applied to:
+   - embedded Postgres by default, or
+   - an external plan DB when `--plan-host` is set.
+
+3. **Inspect desired state from provider database**  
+   Temporary schema names used during planning are normalized back to the target schema names.
+
+4. **Diff current -> desired and build execution plan**  
+   The diff engine emits dependency-aware DDL with deterministic ordering.
+
+### Dependency ordering and foreign keys
+
+The generated migration SQL keeps this high-level order:
+
+1. `DROP` phase
+2. `CREATE` phase
+3. `MODIFY` phase
+4. **Deferred foreign-key flush**
+
+Foreign keys are deferred to the final flush when needed, including:
+
+- referenced table is not yet created in the current create batch
+- referenced PK/UNIQUE is added later in the same migration (`MODIFY` phase), even if the referenced table already exists
+
+This avoids the classic "chicken-and-egg" failure for cyclic/cross-schema FK dependencies while preserving inline FK creation for non-problematic cases.
+
 ## Single schema
 
 `--schema` defaults to `public`. Only that PostgreSQL namespace is loaded from the target database and from the temporary plan database after your SQL is applied.

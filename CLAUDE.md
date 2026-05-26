@@ -136,7 +136,7 @@ PGAPPNAME=pgschema
 
 **Embedded Postgres for Desired State**: The `plan` command spins up a temporary embedded PostgreSQL instance (by default) or connects to an external database (if `--plan-host` is provided), applies the user's SQL files to it, then inspects that database to get the desired state IR. This ensures both desired and current states come from the same source (database inspection), eliminating parser/inspector format differences. External database support is useful for environments where embedded postgres has limitations (e.g., ARM architectures, containerized environments).
 
-**Migration Planning**: The `diff` package compares IR representations to generate a sequence of migration steps with proper dependency ordering (topological sort).
+**Migration Planning**: The `diff` package compares IR representations and emits deterministic migration phases: `DROP -> CREATE -> MODIFY -> deferred FK flush`. Table/view/type ordering uses topological sorting with deterministic cycle breaking.
 
 **Database Integration**: Uses `pgx/v5` for database connections and `embedded-postgres` (v1.33.0) for both the plan command (temporary instances) and integration testing (no Docker required).
 
@@ -220,6 +220,12 @@ The tool supports comprehensive PostgreSQL schema objects (see `ir/ir.go` for co
 - ALTER TABLE ... ADD CONSTRAINT ... NOT VALID for online constraint addition
 - Proper transaction handling - some operations must run outside transactions
 
+**Foreign Key Dependency Handling**:
+
+- FKs are deferred to a final flush when the referenced table/key is not yet satisfiable at create time
+- Smart deferral now also covers the case where referenced tables already exist but their referenced PK/UNIQUE is only added in the same migration `MODIFY` phase
+- This reduces apply-time failures in cyclic and cross-schema FK scenarios while keeping inline FK creation for non-problematic cases
+
 **pgschema Directives**:
 
 - Special SQL comments control behavior: `--pgschema-lock-timeout`, `--pgschema-no-transaction`
@@ -277,7 +283,7 @@ Tests are organized by object type (150+ test cases):
 - `create_materialized_view/` (3), `create_policy/` (10), `create_procedure/` (3), `create_sequence/` (3)
 - `create_table/` (37), `create_trigger/` (7), `create_type/` (3), `create_view/` (4)
 - `default_privilege/` (9), `privilege/` (13)
-- `dependency/` (13), `online/` (14), `migrate/` (5)
+- `dependency/` (14), `online/` (14), `migrate/` (5)
 
 Each test case contains: `old.sql` (starting state), `new.sql` (desired state), `diff.sql` (expected migration DDL), plus `plan.json`, `plan.sql`, `plan.txt` (plan output formats)
 

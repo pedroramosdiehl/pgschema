@@ -944,6 +944,86 @@ func TestApplyCommand_FingerprintMismatch(t *testing.T) {
 	t.Log("Fingerprint validation successfully prevented applying outdated plan to modified database")
 }
 
+// TestApplyCommand_FingerprintMultiSchemaNoMismatch verifies that fingerprint
+// validation in apply uses the same schema scope as plan for comma-separated schemas.
+func TestApplyCommand_FingerprintMultiSchemaNoMismatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	embeddedPG := testutil.SetupPostgres(t)
+	defer embeddedPG.Stop()
+	conn, host, port, dbname, user, password := testutil.ConnectToPostgres(t, embeddedPG)
+	defer conn.Close()
+
+	_, err := conn.ExecContext(ctx, `
+		CREATE SCHEMA comum;
+		CREATE SCHEMA integracao;
+
+		CREATE TABLE comum.tipo_participante (
+			id SERIAL PRIMARY KEY,
+			nome TEXT NOT NULL
+		);
+
+		CREATE TABLE integracao.participante (
+			id SERIAL PRIMARY KEY,
+			id_tipo_participante INT NOT NULL REFERENCES comum.tipo_participante(id)
+		);
+	`)
+	require.NoError(t, err, "failed to setup multi-schema state")
+
+	tmpDir := t.TempDir()
+	desiredStateFile := filepath.Join(tmpDir, "desired_state_multischema.sql")
+	desiredStateSQL := `
+		CREATE TABLE comum.tipo_participante (
+			id SERIAL PRIMARY KEY,
+			nome TEXT NOT NULL
+		);
+
+		CREATE TABLE integracao.participante (
+			id SERIAL PRIMARY KEY,
+			id_tipo_participante INT NOT NULL REFERENCES comum.tipo_participante(id)
+		);
+	`
+	err = os.WriteFile(desiredStateFile, []byte(desiredStateSQL), 0644)
+	require.NoError(t, err, "failed to write desired state file")
+
+	planConfig := &planCmd.PlanConfig{
+		Host:            host,
+		Port:            port,
+		DB:              dbname,
+		User:            user,
+		Password:        password,
+		Schema:          "comum,integracao",
+		File:            desiredStateFile,
+		ApplicationName: "pgschema",
+	}
+
+	migrationPlan, err := planCmd.GeneratePlan(planConfig, sharedEmbeddedPG)
+	require.NoError(t, err, "failed to generate multi-schema migration plan")
+	require.NotNil(t, migrationPlan.SourceFingerprint, "expected source fingerprint in generated plan")
+
+	applyConfig := &ApplyConfig{
+		Host:            host,
+		Port:            port,
+		DB:              dbname,
+		User:            user,
+		Password:        password,
+		Schema:          "comum,integracao",
+		Plan:            migrationPlan,
+		AutoApprove:     true,
+		NoColor:         true,
+		Quiet:           true,
+		LockTimeout:     "",
+		ApplicationName: "pgschema",
+	}
+
+	err = ApplyMigration(applyConfig, nil)
+	require.NoError(t, err, "apply should not fail fingerprint validation on unchanged multi-schema database")
+}
+
 // TestApplyCommand_WaitDirective verifies that wait directives work correctly
 // with concurrent index creation and provide progress monitoring.
 func TestApplyCommand_WaitDirective(t *testing.T) {

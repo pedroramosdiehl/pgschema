@@ -11,6 +11,33 @@ Windows is not supported. Please use WSL (Windows Subsystem for Linux) or a Linu
 - Linux (AMD64, ARM64)
 - macOS (Apple Silicon, Intel)
 
+## Wrapper (Project-pinned)
+
+Use the wrapper when you want reproducible CLI version per repository (similar to Maven Wrapper):
+
+```bash
+# Pin wrapper version for this repository
+./scripts/wrapper/generate.sh --version 1.9.6 --source remote
+
+# Optional: pre-download binary now
+./scripts/wrapper/generate.sh --version 1.9.6 --source remote --download-now
+
+# Local build mode (no binary download)
+./scripts/wrapper/generate.sh --version 1.9.6 --source local
+
+# Run pgschema through wrapper
+./pgschemaw --version
+./pgschemaw plan --help
+```
+
+Wrapper files:
+
+- `pgschemaw` (bash)
+- `pgschemaw.ps1` (PowerShell)
+- `.pgschema-wrapper.properties` (version + download settings)
+
+The wrapper caches downloaded binaries under `.pgschema/wrapper/bin`.
+
 ## macOS
 
 <Tabs>

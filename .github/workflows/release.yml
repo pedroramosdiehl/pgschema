@@ -176,8 +176,48 @@ jobs:
           name: pgschema-rpm-${{ matrix.arch }}
           path: ./dist/*.rpm
 
+  wrapper-assets:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read version
+        id: version
+        run: echo "version=$(cat internal/version/VERSION)" >> $GITHUB_OUTPUT
+
+      - name: Prepare wrapper files
+        run: |
+          mkdir -p dist/wrapper
+          cp pgschemaw dist/wrapper/pgschemaw
+          cp pgschemaw.ps1 dist/wrapper/pgschemaw.ps1
+          cp scripts/wrapper/README.md dist/wrapper/README.md
+          cat > dist/wrapper/.pgschema-wrapper.properties.template <<EOF
+          # pgschema wrapper configuration
+          pgschema.version=${{ steps.version.outputs.version }}
+          pgschema.source=remote
+          pgschema.baseUrl=https://github.com/pgplex/pgschema/releases/download
+          pgschema.cacheDir=.pgschema/wrapper/bin
+          EOF
+          chmod +x dist/wrapper/pgschemaw
+
+      - name: Build wrapper archives
+        run: |
+          mkdir -p dist/out
+          tar -czf dist/out/pgschema-wrapper-${{ steps.version.outputs.version }}.tar.gz -C dist/wrapper .
+          (cd dist/wrapper && zip -q -r ../out/pgschema-wrapper-${{ steps.version.outputs.version }}.zip .)
+
+      - name: Upload wrapper assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: pgschema-wrapper-assets
+          path: |
+            dist/out/pgschema-wrapper-${{ steps.version.outputs.version }}.zip
+            dist/out/pgschema-wrapper-${{ steps.version.outputs.version }}.tar.gz
+
   release:
-    needs: [build-binaries, packages]
+    needs: [build-binaries, packages, wrapper-assets]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -208,6 +248,8 @@ jobs:
             binaries/pgschema-deb-arm64/*.deb
             binaries/pgschema-rpm-amd64/*.rpm
             binaries/pgschema-rpm-arm64/*.rpm
+            binaries/pgschema-wrapper-assets/*.zip
+            binaries/pgschema-wrapper-assets/*.tar.gz
 
   docker:
     needs: [build-binaries, packages]

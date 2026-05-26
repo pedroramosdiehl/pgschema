@@ -15,6 +15,12 @@ type Processor struct {
 	visited map[string]bool
 }
 
+// ProcessedChunk represents SQL materialized from a specific source file.
+type ProcessedChunk struct {
+	SourcePath string
+	Content    string
+}
+
 // NewProcessor creates a new include processor for the given base directory
 func NewProcessor(baseDir string) *Processor {
 	return &Processor{
@@ -25,26 +31,44 @@ func NewProcessor(baseDir string) *Processor {
 
 // ProcessFile processes a SQL file and resolves all \i include directives
 func (p *Processor) ProcessFile(filename string) (string, error) {
+	chunks, err := p.ProcessFileWithChunks(filename)
+	if err != nil {
+		return "", err
+	}
+	return joinChunks(chunks), nil
+}
+
+// ProcessFileWithChunks processes a SQL file and resolves all include directives
+// while preserving source-file provenance for each output chunk.
+func (p *Processor) ProcessFileWithChunks(filename string) ([]ProcessedChunk, error) {
 	// Reset visited map for each top-level file processing
 	p.visited = make(map[string]bool)
-	
+
 	// Get absolute path to ensure consistent path handling
 	absPath, err := filepath.Abs(filename)
 	if err != nil {
-		return "", fmt.Errorf("failed to get absolute path for %s: %w", filename, err)
+		return nil, fmt.Errorf("failed to get absolute path for %s: %w", filename, err)
 	}
-	
+
 	// Update base directory based on the input file's directory
 	p.baseDir = filepath.Dir(absPath)
-	
-	return p.processFileRecursive(absPath)
+
+	return p.processFileRecursiveWithChunks(absPath)
 }
 
 // processFileRecursive recursively processes a file and its includes
 func (p *Processor) processFileRecursive(filename string) (string, error) {
+	chunks, err := p.processFileRecursiveWithChunks(filename)
+	if err != nil {
+		return "", err
+	}
+	return joinChunks(chunks), nil
+}
+
+func (p *Processor) processFileRecursiveWithChunks(filename string) ([]ProcessedChunk, error) {
 	// Check for circular dependencies
 	if p.visited[filename] {
-		return "", fmt.Errorf("circular dependency detected: %s", filename)
+		return nil, fmt.Errorf("circular dependency detected: %s", filename)
 	}
 	
 	// Mark file as visited
@@ -57,69 +81,91 @@ func (p *Processor) processFileRecursive(filename string) (string, error) {
 	// Read the file content
 	content, err := os.ReadFile(filename)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file %s: %w", filename, err)
+		return nil, fmt.Errorf("failed to read file %s: %w", filename, err)
 	}
 	
 	// Process includes in the current file
 	currentDir := filepath.Dir(filename)
-	processedContent, err := p.processIncludes(string(content), currentDir)
+	processedChunks, err := p.processIncludesWithChunks(string(content), currentDir, filename)
 	if err != nil {
-		return "", fmt.Errorf("failed to process includes in %s: %w", filename, err)
+		return nil, fmt.Errorf("failed to process includes in %s: %w", filename, err)
 	}
 	
-	return processedContent, nil
+	return processedChunks, nil
 }
 
 // processIncludes processes \i directives in the given content
 func (p *Processor) processIncludes(content string, currentDir string) (string, error) {
+	chunks, err := p.processIncludesWithChunks(content, currentDir, "")
+	if err != nil {
+		return "", err
+	}
+	return joinChunks(chunks), nil
+}
+
+func (p *Processor) processIncludesWithChunks(content string, currentDir string, sourcePath string) ([]ProcessedChunk, error) {
 	// Regex to match \i directives
 	// Matches: \i filename or \i filename; (with optional semicolon)
 	includeRegex := regexp.MustCompile(`^\s*\\i\s+([^\s;]+)\s*;?\s*$`)
 	
 	lines := strings.Split(content, "\n")
-	var resultLines []string
+	var resultChunks []ProcessedChunk
+	var currentLines []string
+
+	flushCurrent := func() {
+		if len(currentLines) == 0 {
+			return
+		}
+		text := strings.Join(currentLines, "\n")
+		if strings.TrimSpace(text) == "" {
+			currentLines = currentLines[:0]
+			return
+		}
+		resultChunks = append(resultChunks, ProcessedChunk{
+			SourcePath: sourcePath,
+			Content:    text,
+		})
+		currentLines = currentLines[:0]
+	}
 	
 	for _, line := range lines {
 		matches := includeRegex.FindStringSubmatch(line)
 		if matches != nil {
+			flushCurrent()
+
 			// Found an include directive
 			includePath := matches[1]
 
 			// Resolve the include path
 			resolvedPath, isFolder, err := p.resolveIncludePath(includePath, currentDir)
 			if err != nil {
-				return "", fmt.Errorf("failed to resolve include path %s: %w", includePath, err)
+				return nil, fmt.Errorf("failed to resolve include path %s: %w", includePath, err)
 			}
 
-			var includedContent string
+			var includedChunks []ProcessedChunk
 			if isFolder {
 				// Process the folder recursively
-				includedContent, err = p.processFolderRecursive(resolvedPath)
+				includedChunks, err = p.processFolderRecursiveWithChunks(resolvedPath)
 				if err != nil {
-					return "", fmt.Errorf("failed to process included folder %s: %w", resolvedPath, err)
+					return nil, fmt.Errorf("failed to process included folder %s: %w", resolvedPath, err)
 				}
 			} else {
 				// Process the included file recursively
-				includedContent, err = p.processFileRecursive(resolvedPath)
+				includedChunks, err = p.processFileRecursiveWithChunks(resolvedPath)
 				if err != nil {
-					return "", fmt.Errorf("failed to process included file %s: %w", resolvedPath, err)
+					return nil, fmt.Errorf("failed to process included file %s: %w", resolvedPath, err)
 				}
 			}
 
-			// Split included content into lines and add them
-			includedLines := strings.Split(includedContent, "\n")
-			// Remove the last empty line if the content ends with \n
-			if len(includedLines) > 0 && includedLines[len(includedLines)-1] == "" {
-				includedLines = includedLines[:len(includedLines)-1]
-			}
-			resultLines = append(resultLines, includedLines...)
+			resultChunks = append(resultChunks, includedChunks...)
 		} else {
 			// Regular line, add as-is
-			resultLines = append(resultLines, line)
+			currentLines = append(currentLines, line)
 		}
 	}
-	
-	return strings.Join(resultLines, "\n"), nil
+
+	flushCurrent()
+	return resultChunks, nil
 }
 
 // resolveIncludePath resolves an include path relative to the current directory
@@ -184,10 +230,18 @@ func (p *Processor) resolveIncludePath(includePath string, currentDir string) (s
 
 // processFolderRecursive processes all .sql files in a folder using DFS
 func (p *Processor) processFolderRecursive(folderPath string) (string, error) {
+	chunks, err := p.processFolderRecursiveWithChunks(folderPath)
+	if err != nil {
+		return "", err
+	}
+	return joinChunks(chunks), nil
+}
+
+func (p *Processor) processFolderRecursiveWithChunks(folderPath string) ([]ProcessedChunk, error) {
 	// Read directory contents
 	entries, err := os.ReadDir(folderPath)
 	if err != nil {
-		return "", fmt.Errorf("failed to read directory %s: %w", folderPath, err)
+		return nil, fmt.Errorf("failed to read directory %s: %w", folderPath, err)
 	}
 
 	// Sort entries alphabetically (natural filename order)
@@ -195,7 +249,7 @@ func (p *Processor) processFolderRecursive(folderPath string) (string, error) {
 		return entries[i].Name() < entries[j].Name()
 	})
 
-	var resultParts []string
+	var resultChunks []ProcessedChunk
 
 	// Process each entry in alphabetical order
 	for _, entry := range entries {
@@ -203,29 +257,41 @@ func (p *Processor) processFolderRecursive(folderPath string) (string, error) {
 
 		if entry.IsDir() {
 			// Recursively process subdirectory (DFS)
-			subFolderContent, err := p.processFolderRecursive(entryPath)
+			subFolderChunks, err := p.processFolderRecursiveWithChunks(entryPath)
 			if err != nil {
-				return "", fmt.Errorf("failed to process subdirectory %s: %w", entryPath, err)
+				return nil, fmt.Errorf("failed to process subdirectory %s: %w", entryPath, err)
 			}
-			if subFolderContent != "" {
-				resultParts = append(resultParts, subFolderContent)
-			}
+			resultChunks = append(resultChunks, subFolderChunks...)
 		} else if strings.HasSuffix(entry.Name(), ".sql") {
 			// Process .sql file
-			fileContent, err := p.processFileRecursive(entryPath)
+			fileChunks, err := p.processFileRecursiveWithChunks(entryPath)
 			if err != nil {
-				return "", fmt.Errorf("failed to process file %s: %w", entryPath, err)
+				return nil, fmt.Errorf("failed to process file %s: %w", entryPath, err)
 			}
-			if fileContent != "" {
-				// Ensure the file content ends with a newline for proper concatenation
-				if !strings.HasSuffix(fileContent, "\n") {
-					fileContent += "\n"
-				}
-				resultParts = append(resultParts, fileContent)
-			}
+			resultChunks = append(resultChunks, fileChunks...)
 		}
 		// Ignore non-.sql files
 	}
 
-	return strings.Join(resultParts, ""), nil
+	return resultChunks, nil
+}
+
+func joinChunks(chunks []ProcessedChunk) string {
+	if len(chunks) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	prevEndsWithNewline := false
+	for _, chunk := range chunks {
+		content := chunk.Content
+		if content == "" {
+			continue
+		}
+		if b.Len() > 0 && !prevEndsWithNewline && !strings.HasPrefix(content, "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteString(content)
+		prevEndsWithNewline = strings.HasSuffix(content, "\n")
+	}
+	return b.String()
 }
