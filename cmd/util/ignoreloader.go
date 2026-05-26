@@ -36,6 +36,14 @@ type TomlConfig struct {
 	Sequences         SequenceIgnoreConfig         `toml:"sequences,omitempty"`
 	Privileges        PrivilegeIgnoreConfig        `toml:"privileges,omitempty"`
 	DefaultPrivileges DefaultPrivilegeIgnoreConfig `toml:"default_privileges,omitempty"`
+	Constraints       ConstraintIgnoreConfig       `toml:"constraints,omitempty"`
+	ConstraintsFK     ConstraintFKIgnoreConfig     `toml:"constraints_fk,omitempty"`
+	DMLTables         DMLTableIgnoreConfig         `toml:"dml_tables,omitempty"`
+}
+
+// TableIgnoreConfig represents table-specific ignore configuration
+type DMLTableIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
 }
 
 // TableIgnoreConfig represents table-specific ignore configuration
@@ -80,6 +88,18 @@ type DefaultPrivilegeIgnoreConfig struct {
 	Patterns []string `toml:"patterns,omitempty"`
 }
 
+// ConstraintIgnoreConfig represents constraint-specific ignore configuration
+// Patterns match constraint names, including optionally qualified names
+type ConstraintIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
+}
+
+// ConstraintFKIgnoreConfig represents foreign key constraint-specific ignore configuration
+// Patterns match constraint names, including optionally qualified names
+type ConstraintFKIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
+}
+
 // LoadIgnoreFileWithStructure loads the .pgschemaignore file using the structured TOML format
 // and converts it to the simple IgnoreConfig structure
 func LoadIgnoreFileWithStructure() (*ir.IgnoreConfig, error) {
@@ -113,6 +133,9 @@ func LoadIgnoreFileWithStructureFromPath(filePath string) (*ir.IgnoreConfig, err
 		Sequences:         tomlConfig.Sequences.Patterns,
 		Privileges:        tomlConfig.Privileges.Patterns,
 		DefaultPrivileges: tomlConfig.DefaultPrivileges.Patterns,
+		Constraints:       tomlConfig.Constraints.Patterns,
+		ConstraintsFK:     tomlConfig.ConstraintsFK.Patterns,
+		DMLTables:         tomlConfig.DMLTables.Patterns,
 	}
 
 	return config, nil
