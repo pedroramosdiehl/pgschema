@@ -7,7 +7,9 @@ import (
 	"runtime"
 
 	"github.com/pgplex/pgschema/cmd/apply"
+	"github.com/pgplex/pgschema/cmd/applydata"
 	"github.com/pgplex/pgschema/cmd/dump"
+	"github.com/pgplex/pgschema/cmd/dumpdata"
 	"github.com/pgplex/pgschema/cmd/plan"
 	globallogger "github.com/pgplex/pgschema/internal/logger"
 	"github.com/pgplex/pgschema/internal/version"
@@ -31,9 +33,11 @@ var RootCmd = &cobra.Command{
 Version: %s@%s %s %s
 
 Commands:
-  dump    Dump PostgreSQL schema
-  plan    Generate migration plan
-  apply   Apply schema migrations
+  dump    		Dump PostgreSQL schema
+  plan    		Generate migration plan
+  apply   		Apply schema migrations
+  dump-data   	Dump PostgreSQL table data as INSERT statements
+  applydata 	Apply data migrations
 
 Use "pgschema [command] --help" for more information about a command.`,
 		version.App(), GitCommit, platform(), BuildDate),
@@ -49,6 +53,8 @@ func init() {
 	RootCmd.AddCommand(dump.DumpCmd)
 	RootCmd.AddCommand(plan.PlanCmd)
 	RootCmd.AddCommand(apply.ApplyCmd)
+	RootCmd.AddCommand(dumpdata.DumpDataCmd)
+	RootCmd.AddCommand(applydata.ApplyCmd)
 }
 
 func setupLogger() {

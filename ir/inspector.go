@@ -460,6 +460,18 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 			constraintType = constraint.ConstraintType.String
 		}
 
+		// Check if constraint should be ignored. Prefer a fully qualified
+		// identifier to avoid unintentionally ignoring same-named constraints
+		// on unrelated tables, while still supporting bare constraint-name
+		// matching for backwards compatibility.
+		if i.ignoreConfig != nil {
+			qualifiedConstraintName := fmt.Sprintf("%s.%s.%s", schemaName, tableName, constraintName)
+			if i.ignoreConfig.ShouldIgnoreConstraint(qualifiedConstraintName) ||
+				i.ignoreConfig.ShouldIgnoreConstraint(constraintName) {
+				continue
+			}
+		}
+
 		// Extract column name from sql.NullString
 		columnName := ""
 		if constraint.ColumnName.Valid {
@@ -512,6 +524,18 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 
 			// Handle foreign key references
 			if cType == ConstraintTypeForeignKey {
+				// Check if constraint should be ignored. Prefer a fully qualified
+				// identifier to avoid unintentionally ignoring same-named constraints
+				// on unrelated tables, while still supporting bare constraint-name
+				// matching for backwards compatibility.
+				if i.ignoreConfig != nil {
+					qualifiedConstraintName := fmt.Sprintf("%s.%s.%s", schemaName, tableName, constraintName)
+					if i.ignoreConfig.ShouldIgnoreConstraintFK(qualifiedConstraintName) ||
+						i.ignoreConfig.ShouldIgnoreConstraintFK(constraintName) {
+						continue
+					}
+				}
+
 				if refSchema := i.safeInterfaceToString(constraint.ForeignTableSchema); refSchema != "" && refSchema != "<nil>" {
 					c.ReferencedSchema = refSchema
 				}

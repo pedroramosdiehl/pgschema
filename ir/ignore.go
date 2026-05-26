@@ -24,6 +24,9 @@ type IgnoreConfig struct {
 	Sequences         []string `toml:"sequences,omitempty"`
 	Privileges        []string `toml:"privileges,omitempty"`
 	DefaultPrivileges []string `toml:"default_privileges,omitempty"`
+	Constraints       []string `toml:"constraints,omitempty"`
+	ConstraintsFK     []string `toml:"constraints_fk,omitempty"`
+	DMLTables         []string `toml:"dml_tables,omitempty"`
 }
 
 // ShouldIgnoreTable checks if a table should be ignored based on the patterns
@@ -74,6 +77,14 @@ func (c *IgnoreConfig) ShouldIgnoreSequence(sequenceName string) bool {
 	return c.shouldIgnore(sequenceName, c.Sequences)
 }
 
+// ShouldIgnoreDMLTable checks if a table should be ignored based on the patterns
+func (c *IgnoreConfig) ShouldIgnoreDMLTable(tableName string) bool {
+	if c == nil {
+		return false
+	}
+	return c.shouldIgnore(tableName, c.DMLTables)
+}
+
 // ShouldIgnorePrivilegeByObjectType checks if a privilege should be ignored based on the object name
 // and its type. When an object (function, table, etc.) is ignored via its section pattern,
 // privileges on that object should also be ignored.
@@ -112,6 +123,22 @@ func (c *IgnoreConfig) ShouldIgnoreDefaultPrivilege(grantee string) bool {
 		return false
 	}
 	return c.shouldIgnore(grantee, c.DefaultPrivileges)
+}
+
+// ShouldIgnoreConstraint checks if a constraint should be ignored based on the patterns
+func (c *IgnoreConfig) ShouldIgnoreConstraint(constraintName string) bool {
+	if c == nil {
+		return false
+	}
+	return c.shouldIgnore(constraintName, c.Constraints)
+}
+
+// ShouldIgnoreConstraintFK checks if a foreign key constraint should be ignored based on the patterns
+func (c *IgnoreConfig) ShouldIgnoreConstraintFK(constraintName string) bool {
+	if c == nil {
+		return false
+	}
+	return c.shouldIgnore(constraintName, c.ConstraintsFK)
 }
 
 // shouldIgnore checks if a name should be ignored based on the patterns
